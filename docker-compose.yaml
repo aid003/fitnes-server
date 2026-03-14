@@ -1,0 +1,56 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: senturion_user
+      POSTGRES_PASSWORD: "senturion_d18d4!04"
+      POSTGRES_DB: postgres_db
+      PGDATA: /var/lib/postgresql/18/docker
+      POSTGRES_MAX_CONNECTIONS: 150
+      POSTGRES_SHARED_BUFFERS: 512MB
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 2GB
+    ports:
+      - "5430:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U senturion_user -d postgres_db"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --slave-read-only no
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: "postgres://senturion_user:senturion_d18d4!04@postgres:5432/postgres_db"
+      POOL_MODE: transaction
+      MAX_PREPARED_STATEMENTS: 256
+      MAX_CLIENT_CONN: 1000
+      DEFAULT_POOL_SIZE: 70
+      RESERVE_POOL_SIZE: 80
+      SERVER_IDLE_TIMEOUT: 60
+      AUTH_TYPE: scram-sha-256
+    ports:
+      - "6432:5432"
+
+volumes:
+  postgres_data:
+  redis_data:
