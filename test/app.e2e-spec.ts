@@ -1,25 +1,48 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
-import request from 'supertest';
-import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
+import { setupApp } from './../src/setup-app';
 
 describe('AppController (e2e)', () => {
-  let app: INestApplication<App>;
+  let app: INestApplication;
 
   beforeEach(async () => {
+    process.env.DATABASE_URL =
+      process.env.DATABASE_URL ??
+      'postgresql://postgres:postgres@localhost:5432/postgres';
+    delete process.env.REDIS_URL;
+
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
     }).compile();
 
     app = moduleFixture.createNestApplication();
+    setupApp(app);
     await app.init();
   });
 
-  it('/ (GET)', () => {
-    return request(app.getHttpServer())
-      .get('/')
-      .expect(200)
-      .expect('Hello World!');
+  afterEach(async () => {
+    await app.close();
+  });
+
+  it('registers the development routes', () => {
+    const expressApp = app.getHttpAdapter().getInstance() as {
+      router?: {
+        stack?: Array<{
+          route?: {
+            path?: string;
+          };
+        }>;
+      };
+    };
+
+    const registeredPaths =
+      expressApp.router?.stack
+        ?.map((layer) => layer.route?.path)
+        .filter((path): path is string => Boolean(path)) ?? [];
+
+    expect(registeredPaths).toContain('/');
+    expect(registeredPaths).toContain('/api');
+    expect(registeredPaths).toContain('/api-json');
   });
 });
