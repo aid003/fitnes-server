@@ -1,4 +1,5 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { LoggerErrorInterceptor } from 'nestjs-pino';
 import { SessionService } from './auth/session/session.service';
@@ -11,6 +12,9 @@ export type AppDocsConfig = {
 export function setupApp(app: INestApplication): AppDocsConfig {
   const uiPath = 'api';
   const jsonPath = 'api-json';
+  const configService = app.get(ConfigService);
+  const frontendOrigin =
+    configService.get<string>('FRONTEND_ORIGIN') ?? 'http://localhost:3000';
 
   app.useGlobalInterceptors(new LoggerErrorInterceptor());
   app.useGlobalPipes(
@@ -21,6 +25,10 @@ export function setupApp(app: INestApplication): AppDocsConfig {
     }),
   );
   app.use(app.get(SessionService).getMiddleware());
+  app.enableCors({
+    origin: frontendOrigin,
+    credentials: true,
+  });
 
   const swaggerConfig = new DocumentBuilder()
     .setTitle('Fitnes Server API')

@@ -1,0 +1,20 @@
+import { Transform } from 'class-transformer';
+import { IsEmail, IsString, MaxLength, MinLength } from 'class-validator';
+
+export class ResetPasswordRecoveryDto {
+  @Transform(({ value }) =>
+    typeof value === 'string' ? value.trim().toLowerCase() : (value as unknown),
+  )
+  @IsEmail()
+  email!: string;
+
+  @IsString()
+  @MinLength(1)
+  @MaxLength(32)
+  code!: string;
+
+  @IsString()
+  @MinLength(8)
+  @MaxLength(128)
+  password!: string;
+}

@@ -7,6 +7,7 @@ import { createPinoHttpConfig } from './common/logger/pino.config';
 import { PrismaModule } from './prisma/prisma.module';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
+import { PassesModule } from './passes/passes.module';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { UsersModule } from './users/users.module';
     PrismaModule,
     UsersModule,
     AuthModule,
+    PassesModule,
   ],
   controllers: [AppController],
   providers: [AppService],

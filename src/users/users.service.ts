@@ -25,6 +25,12 @@ export type PublicUser = Prisma.UserGetPayload<{
   select: typeof userPublicSelect;
 }>;
 
+export type UserAuthState = {
+  id: string;
+  role: UserRole;
+  isActive: boolean;
+};
+
 @Injectable()
 export class UsersService {
   constructor(
@@ -81,6 +87,23 @@ export class UsersService {
       select: userPublicSelect,
       orderBy: { createdAt: 'desc' },
     });
+  }
+
+  async getAuthState(userId: string): Promise<UserAuthState> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        role: true,
+        isActive: true,
+      },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    return user;
   }
 
   async updateMe(userId: string, dto: UpdateSelfDto): Promise<PublicUser> {

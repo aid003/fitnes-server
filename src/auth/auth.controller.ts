@@ -15,7 +15,10 @@ import { AuthenticatedGuard } from '../common/auth/authenticated.guard';
 import type { SessionUser } from '../common/auth/session-user.interface';
 import { AuthService } from './auth.service';
 import { LoginDto } from './dto/login.dto';
+import { RequestPasswordRecoveryDto } from './dto/request-password-recovery.dto';
 import { RegisterDto } from './dto/register.dto';
+import { ResetPasswordRecoveryDto } from './dto/reset-password-recovery.dto';
+import { VerifyPasswordRecoveryDto } from './dto/verify-password-recovery.dto';
 
 @Controller('auth')
 export class AuthController {
@@ -30,6 +33,24 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   login(@Body() dto: LoginDto, @Req() request: Request) {
     return this.authService.login(dto, request);
+  }
+
+  @Post('recovery/request')
+  @HttpCode(HttpStatus.OK)
+  requestPasswordRecovery(@Body() dto: RequestPasswordRecoveryDto) {
+    return this.authService.requestPasswordRecovery(dto);
+  }
+
+  @Post('recovery/verify')
+  @HttpCode(HttpStatus.OK)
+  verifyPasswordRecovery(@Body() dto: VerifyPasswordRecoveryDto) {
+    return this.authService.verifyPasswordRecovery(dto);
+  }
+
+  @Post('recovery/reset')
+  @HttpCode(HttpStatus.OK)
+  resetPasswordRecovery(@Body() dto: ResetPasswordRecoveryDto) {
+    return this.authService.resetPasswordRecovery(dto);
   }
 
   @Post('logout')

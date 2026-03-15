@@ -12,6 +12,31 @@ enum UserRole {
   COACH
 }
 
+enum DurationUnit {
+  DAY
+  WEEK
+  MONTH
+  YEAR
+}
+
+enum BillingType {
+  FIXED_TERM
+  UNLIMITED
+  SINGLE_VISIT
+  VISIT_PACK
+}
+
+enum PassFeatureIcon {
+  TICKET
+  FLAME
+  SNOWFLAKE
+  CALENDAR
+  GIFT
+  DUMBBELL
+  POOL
+  COMBO
+}
+
 model User {
   id                  String               @id @default(cuid())
   email               String               @unique
@@ -37,4 +62,105 @@ model EmailLoginChallenge {
 
   @@index([email, expiresAt])
   @@index([userId])
+}
+
+model PassCategory {
+  id            String        @id @default(cuid())
+  title         String
+  slug          String        @unique
+  description   String?
+  coverImageUrl String?
+  sortOrder     Int           @default(0)
+  isActive      Boolean       @default(true)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  variants      PassVariant[]
+
+  @@index([isActive, sortOrder])
+}
+
+model PassVariant {
+  id          String          @id @default(cuid())
+  categoryId  String
+  title       String
+  slug        String
+  description String?
+  sortOrder   Int             @default(0)
+  isActive    Boolean         @default(true)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  category    PassCategory    @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  groups      PassPlanGroup[]
+
+  @@unique([categoryId, slug])
+  @@index([categoryId, isActive, sortOrder])
+}
+
+model PassPlanGroup {
+  id          String       @id @default(cuid())
+  variantId   String
+  title       String
+  slug        String
+  description String?
+  sortOrder   Int          @default(0)
+  isActive    Boolean      @default(true)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  variant     PassVariant  @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  plans       PassPlan[]
+
+  @@unique([variantId, slug])
+  @@index([variantId, isActive, sortOrder])
+}
+
+model PassPlan {
+  id             String          @id @default(cuid())
+  groupId         String
+  title           String
+  slug            String
+  description     String?
+  subtitle        String?
+  price           Int
+  currency        String          @default("RUB")
+  durationValue   Int?
+  durationUnit    DurationUnit?
+  visitCount      Int?
+  billingType     BillingType?
+  highlightStyle  String?
+  sortOrder       Int             @default(0)
+  isActive        Boolean         @default(true)
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  group           PassPlanGroup   @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  badges          PassBadge[]
+  features        PassFeature[]
+
+  @@unique([groupId, slug])
+  @@index([groupId, isActive, sortOrder])
+}
+
+model PassBadge {
+  id          String    @id @default(cuid())
+  planId       String
+  label        String
+  style        String?
+  sortOrder    Int       @default(0)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  plan         PassPlan  @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@index([planId, sortOrder])
+}
+
+model PassFeature {
+  id         String          @id @default(cuid())
+  planId      String
+  label       String
+  icon        PassFeatureIcon
+  sortOrder   Int             @default(0)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  plan        PassPlan        @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@index([planId, sortOrder])
 }
