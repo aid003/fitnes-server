@@ -37,6 +37,24 @@ enum PassFeatureIcon {
   COMBO
 }
 
+enum MembershipStatus {
+  ACTIVE
+  FROZEN
+  EXPIRED
+}
+
+enum MembershipFreezeStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum MembershipRenewalStatus {
+  PENDING
+  PROCESSED
+  CANCELLED
+}
+
 model User {
   id                  String               @id @default(cuid())
   email               String               @unique
@@ -47,6 +65,8 @@ model User {
   createdAt           DateTime             @default(now())
   updatedAt           DateTime             @updatedAt
   emailLoginChallenges EmailLoginChallenge[]
+  memberships         UserMembership[]
+  membershipRenewalRequests UserMembershipRenewalRequest[]
 }
 
 model EmailLoginChallenge {
@@ -134,9 +154,64 @@ model PassPlan {
   group           PassPlanGroup   @relation(fields: [groupId], references: [id], onDelete: Cascade)
   badges          PassBadge[]
   features        PassFeature[]
+  memberships     UserMembership[]
 
   @@unique([groupId, slug])
   @@index([groupId, isActive, sortOrder])
+}
+
+model UserMembership {
+  id                    String                         @id @default(cuid())
+  userId                String
+  passPlanId            String
+  title                 String
+  subtitle              String?
+  description           String?
+  startsAt              DateTime
+  endsAt                DateTime
+  status                MembershipStatus              @default(ACTIVE)
+  freezeDaysLimit       Int                            @default(0)
+  freezeDaysUsed        Int                            @default(0)
+  canRenew              Boolean                        @default(true)
+  sortOrder             Int                            @default(0)
+  createdAt             DateTime                       @default(now())
+  updatedAt             DateTime                       @updatedAt
+  user                  User                           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  passPlan              PassPlan                       @relation(fields: [passPlanId], references: [id], onDelete: Restrict)
+  freezes               UserMembershipFreeze[]
+  renewalRequests       UserMembershipRenewalRequest[]
+
+  @@index([userId, status, startsAt])
+  @@index([passPlanId])
+}
+
+model UserMembershipFreeze {
+  id            String                  @id @default(cuid())
+  membershipId  String
+  startsAt      DateTime
+  endsAt        DateTime
+  daysUsed      Int
+  status        MembershipFreezeStatus  @default(ACTIVE)
+  createdAt     DateTime                @default(now())
+  updatedAt     DateTime                @updatedAt
+  membership    UserMembership          @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+
+  @@index([membershipId, status, startsAt])
+}
+
+model UserMembershipRenewalRequest {
+  id            String                   @id @default(cuid())
+  membershipId  String
+  userId        String
+  comment       String?
+  status        MembershipRenewalStatus  @default(PENDING)
+  createdAt     DateTime                 @default(now())
+  updatedAt     DateTime                 @updatedAt
+  membership    UserMembership           @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  user          User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([membershipId, status, createdAt])
+  @@index([userId, status, createdAt])
 }
 
 model PassBadge {

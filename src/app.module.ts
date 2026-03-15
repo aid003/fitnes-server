@@ -6,6 +6,7 @@ import { LoggerModule } from 'nestjs-pino';
 import { createPinoHttpConfig } from './common/logger/pino.config';
 import { PrismaModule } from './prisma/prisma.module';
 import { AuthModule } from './auth/auth.module';
+import { MembershipsModule } from './memberships/memberships.module';
 import { UsersModule } from './users/users.module';
 import { PassesModule } from './passes/passes.module';
 
@@ -24,6 +25,7 @@ import { PassesModule } from './passes/passes.module';
     UsersModule,
     AuthModule,
     PassesModule,
+    MembershipsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
