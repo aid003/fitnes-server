@@ -6,6 +6,10 @@
   "private": true,
   "license": "UNLICENSED",
   "scripts": {
+    "pm2": "pm2 start ecosystem.config.cjs",
+    "pm2:restart": "pm2 restart fitnes-server",
+    "pm2:stop": "pm2 stop fitnes-server",
+    "pm2:logs": "pm2 logs fitnes-server",
     "build": "nest build",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "prisma:format": "prisma format",
