@@ -55,6 +55,16 @@ enum MembershipRenewalStatus {
   CANCELLED
 }
 
+enum ScheduleWeekday {
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+  SATURDAY
+  SUNDAY
+}
+
 model User {
   id                  String               @id @default(cuid())
   email               String               @unique
@@ -212,6 +222,23 @@ model UserMembershipRenewalRequest {
 
   @@index([membershipId, status, createdAt])
   @@index([userId, status, createdAt])
+}
+
+model ScheduleTemplateSlot {
+  id              String          @id @default(cuid())
+  weekday         ScheduleWeekday
+  title           String
+  startTime       String
+  endTime         String
+  ageBadge        String?
+  secondaryBadge  String?
+  bookingEnabled  Boolean         @default(true)
+  sortOrder       Int             @default(0)
+  isActive        Boolean         @default(true)
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@index([weekday, isActive, sortOrder, startTime])
 }
 
 model PassBadge {

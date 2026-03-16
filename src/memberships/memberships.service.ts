@@ -6,7 +6,6 @@ import {
 } from '@nestjs/common';
 import {
   MembershipFreezeStatus,
-  MembershipRenewalStatus,
   MembershipStatus,
   Prisma,
 } from '@prisma/client';
@@ -14,11 +13,11 @@ import { handlePrismaError } from '../common/database/prisma-errors';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateMembershipDto } from './dto/create-membership.dto';
 import { CreateMembershipFreezeDto } from './dto/create-membership-freeze.dto';
-import { CreateMembershipRenewalDto } from './dto/create-membership-renewal.dto';
 import { UpdateMembershipDto } from './dto/update-membership.dto';
 
 const DAY_IN_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_FREEZE_DAYS = 7;
+const RENEWAL_WINDOW_DAYS = 14;
 
 const membershipSelect = {
   id: true,
@@ -164,42 +163,6 @@ export class MembershipsService {
         },
       }),
     ]);
-
-    return this.getMyMemberships(userId);
-  }
-
-  async requestRenewal(
-    userId: string,
-    membershipId: string,
-    dto: CreateMembershipRenewalDto,
-  ) {
-    const membership = await this.getMembershipForUser(userId, membershipId);
-    const synced = await this.syncMembershipState(membership);
-
-    if (!synced.canRenew) {
-      throw new BadRequestException('Renewal is unavailable for this membership');
-    }
-
-    const hasPendingRequest = synced.renewalRequests.some(
-      (request) => request.status === MembershipRenewalStatus.PENDING,
-    );
-
-    if (hasPendingRequest) {
-      throw new BadRequestException('Renewal request already exists');
-    }
-
-    try {
-      await this.prisma.userMembershipRenewalRequest.create({
-        data: {
-          membershipId: synced.id,
-          userId,
-          comment: dto.comment?.trim() || undefined,
-          status: MembershipRenewalStatus.PENDING,
-        },
-      });
-    } catch (error) {
-      handlePrismaError(error, 'Membership renewal request');
-    }
 
     return this.getMyMemberships(userId);
   }
@@ -374,42 +337,18 @@ export class MembershipsService {
       throw new NotFoundException('Membership not found');
     }
 
-    const activeFreeze = getActiveFreeze(membership);
-
-    if (!activeFreeze) {
-      throw new BadRequestException('Membership has no active freeze');
-    }
-
-    const now = new Date();
-    const actualDays = getUsedDays(activeFreeze.startsAt, now);
-    const unusedDays = Math.max(0, activeFreeze.daysUsed - actualDays);
-    const nextEndsAt = subtractDays(membership.endsAt, unusedDays);
-    const nextStatus =
-      nextEndsAt <= now ? MembershipStatus.EXPIRED : MembershipStatus.ACTIVE;
-
-    await this.prisma.$transaction([
-      this.prisma.userMembershipFreeze.update({
-        where: { id: activeFreeze.id },
-        data: {
-          status: MembershipFreezeStatus.COMPLETED,
-          endsAt: now,
-          daysUsed: actualDays,
-        },
-      }),
-      this.prisma.userMembership.update({
-        where: { id: membershipId },
-        data: {
-          status: nextStatus,
-          endsAt: nextEndsAt,
-          freezeDaysUsed: Math.max(
-            0,
-            membership.freezeDaysUsed - unusedDays,
-          ),
-        },
-      }),
-    ]);
+    await this.unfreezeMembershipRecord(membership);
 
     return this.listAdminMemberships();
+  }
+
+  async unfreezeMembershipForUser(userId: string, membershipId: string) {
+    const membership = await this.getMembershipForUser(userId, membershipId);
+    const synced = await this.syncMembershipState(membership);
+
+    await this.unfreezeMembershipRecord(synced);
+
+    return this.getMyMemberships(userId);
   }
 
   private async getMembershipForUser(userId: string, membershipId: string) {
@@ -505,16 +444,48 @@ export class MembershipsService {
     return membership;
   }
 
+  private async unfreezeMembershipRecord(membership: MembershipRecord) {
+    const activeFreeze = getActiveFreeze(membership);
+
+    if (!activeFreeze) {
+      throw new BadRequestException('Membership has no active freeze');
+    }
+
+    const now = new Date();
+    const actualDays = getUsedDays(activeFreeze.startsAt, now);
+    const unusedDays = Math.max(0, activeFreeze.daysUsed - actualDays);
+    const nextEndsAt = subtractDays(membership.endsAt, unusedDays);
+    const nextStatus =
+      nextEndsAt <= now ? MembershipStatus.EXPIRED : MembershipStatus.ACTIVE;
+
+    await this.prisma.$transaction([
+      this.prisma.userMembershipFreeze.update({
+        where: { id: activeFreeze.id },
+        data: {
+          status: MembershipFreezeStatus.COMPLETED,
+          endsAt: now,
+          daysUsed: actualDays,
+        },
+      }),
+      this.prisma.userMembership.update({
+        where: { id: membership.id },
+        data: {
+          status: nextStatus,
+          endsAt: nextEndsAt,
+          freezeDaysUsed: Math.max(0, membership.freezeDaysUsed - unusedDays),
+        },
+      }),
+    ]);
+  }
+
   private mapMembershipCard(membership: MembershipRecord) {
-    const pendingRenewal = membership.renewalRequests.find(
-      (request) => request.status === MembershipRenewalStatus.PENDING,
-    );
     const freezeDaysLeft = Math.max(
       0,
       membership.freezeDaysLimit - membership.freezeDaysUsed,
     );
     const daysLeft = getDaysLeft(membership.endsAt);
-    const status = getStatusMeta(membership.status, pendingRenewal !== undefined);
+    const renewalAvailable = membership.canRenew && canRequestRenewalNow(membership);
+    const status = getStatusMeta(membership.status, renewalAvailable);
 
     return {
       id: membership.id,
@@ -538,22 +509,25 @@ export class MembershipsService {
         membership.status === MembershipStatus.ACTIVE &&
         freezeDaysLeft > 0 &&
         !getActiveFreeze(membership),
-      canRenew: membership.canRenew && !pendingRenewal,
+      canUnfreeze: membership.status === MembershipStatus.FROZEN && Boolean(getActiveFreeze(membership)),
+      canRenew: membership.canRenew,
+      canRequestRenewalNow: renewalAvailable,
       scheduleAvailable: false,
       history: buildMembershipHistory(membership),
-      pendingRenewal: Boolean(pendingRenewal),
     };
   }
 
   private mapHistoryItem(membership: MembershipRecord) {
+    const status = getStatusMeta(membership.status, false);
+
     return {
       id: membership.id,
       title: membership.title,
       subtitle: formatMembershipPeriod(membership.startsAt, membership.endsAt),
       startsAt: membership.startsAt.toISOString(),
       status: membership.status,
-      statusLabel: getStatusMeta(membership.status, false).label,
-      statusTone: getStatusMeta(membership.status, false).tone,
+      statusLabel: status.label,
+      statusTone: status.tone,
       expiresAt: membership.endsAt.toISOString(),
       history: buildMembershipHistory(membership),
       features: membership.passPlan.features.map((feature) => ({
@@ -642,32 +616,21 @@ function buildMembershipHistory(membership: MembershipRecord) {
     });
   }
 
-  for (const request of membership.renewalRequests) {
-    entries.push({
-      id: request.id,
-      label: `Продление: ${formatRenewalStatus(request.status)} ${formatDate(
-        request.createdAt,
-      )}`,
-      tone:
-        request.status === MembershipRenewalStatus.PENDING ? 'accent' : 'default',
-    });
-  }
-
   return entries;
 }
 
-function getStatusMeta(status: MembershipStatus, hasPendingRenewal: boolean) {
-  if (hasPendingRenewal) {
-    return {
-      label: 'Заявка на продление',
-      tone: 'warning',
-    };
-  }
-
+function getStatusMeta(status: MembershipStatus, canRequestRenewal: boolean) {
   if (status === MembershipStatus.FROZEN) {
     return {
       label: 'Заморожен',
       tone: 'muted',
+    };
+  }
+
+  if (status === MembershipStatus.EXPIRED && canRequestRenewal) {
+    return {
+      label: 'Доступно продление',
+      tone: 'warning',
     };
   }
 
@@ -688,8 +651,20 @@ function isVisibleInActiveBlock(membership: MembershipRecord) {
   return (
     membership.status === MembershipStatus.ACTIVE ||
     membership.status === MembershipStatus.FROZEN ||
-    (membership.status === MembershipStatus.EXPIRED && membership.canRenew)
+    (membership.status === MembershipStatus.EXPIRED &&
+      membership.canRenew &&
+      canRequestRenewalNow(membership))
   );
+}
+
+function canRequestRenewalNow(
+  membership: Pick<MembershipRecord, 'endsAt' | 'canRenew'>,
+) {
+  if (!membership.canRenew) {
+    return false;
+  }
+
+  return membership.endsAt.getTime() - Date.now() <= RENEWAL_WINDOW_DAYS * DAY_IN_MS;
 }
 
 function getDaysLeft(endsAt: Date) {
@@ -703,8 +678,12 @@ function getDaysLeft(endsAt: Date) {
 }
 
 function getActiveFreeze(membership: Pick<MembershipRecord, 'freezes'>) {
+  const now = new Date();
+
   return membership.freezes.find(
-    (freeze) => freeze.status === MembershipFreezeStatus.ACTIVE,
+    (freeze) =>
+      freeze.status === MembershipFreezeStatus.ACTIVE ||
+      (freeze.status !== MembershipFreezeStatus.CANCELLED && freeze.endsAt > now),
   );
 }
 
@@ -732,18 +711,6 @@ function formatDate(date: Date) {
     month: 'long',
     year: 'numeric',
   }).format(date);
-}
-
-function formatRenewalStatus(status: MembershipRenewalStatus) {
-  if (status === MembershipRenewalStatus.PROCESSED) {
-    return 'Продление обработано';
-  }
-
-  if (status === MembershipRenewalStatus.CANCELLED) {
-    return 'Продление отменено';
-  }
-
-  return 'Заявка на продление';
 }
 
 function parseDate(value: string, fieldName: string) {

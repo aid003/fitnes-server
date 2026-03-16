@@ -44,6 +44,8 @@ describe('MembershipsService', () => {
   };
 
   beforeEach(() => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-05-05T00:00:00.000Z'));
+
     prismaService = {
       user: {
         findUnique: jest.fn().mockResolvedValue({ id: 'user-1' }),
@@ -72,6 +74,10 @@ describe('MembershipsService', () => {
     };
 
     membershipsService = new MembershipsService(prismaService as PrismaService);
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
   });
 
   it('splits active and completed memberships for the current user', async () => {
@@ -124,33 +130,85 @@ describe('MembershipsService', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 
-  it('creates renewal request for a renewable membership', async () => {
+  it('applies freeze immediately and extends membership end date', async () => {
     prismaService.userMembership.findFirst.mockResolvedValue(membershipRecord);
     prismaService.userMembership.findMany.mockResolvedValue([membershipRecord]);
 
-    await membershipsService.requestRenewal('user-1', 'membership-1', {
-      comment: 'Хочу продлить',
-    });
+    await membershipsService.freezeMembership('user-1', 'membership-1', { days: 5 });
 
-    expect(
-      prismaService.userMembershipRenewalRequest.create,
-    ).toHaveBeenCalledWith(
+    expect(prismaService.userMembershipFreeze.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
           membershipId: 'membership-1',
-          userId: 'user-1',
-          status: 'PENDING',
+          daysUsed: 5,
+          status: 'ACTIVE',
+        }),
+      }),
+    );
+    expect(prismaService.userMembership.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'membership-1' },
+        data: expect.objectContaining({
+          status: 'FROZEN',
+          freezeDaysUsed: 5,
+          endsAt: new Date('2026-05-17T00:00:00.000Z'),
         }),
       }),
     );
   });
 
-  it('prevents renewal of unavailable membership', async () => {
-    prismaService.userMembership.findFirst.mockResolvedValue(null);
+  it('rejects freeze for expired membership', async () => {
+    prismaService.userMembership.findFirst.mockResolvedValue({
+      ...membershipRecord,
+      status: 'EXPIRED',
+    });
 
     await expect(
-      membershipsService.requestRenewal('user-2', 'membership-1', {}),
-    ).rejects.toBeInstanceOf(ForbiddenException);
+      membershipsService.freezeMembership('user-1', 'membership-1', {}),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('allows user to unfreeze membership and return unused freeze days', async () => {
+    prismaService.userMembership.findFirst.mockResolvedValue({
+      ...membershipRecord,
+      status: 'FROZEN',
+      freezeDaysUsed: 7,
+      endsAt: new Date('2026-05-19T00:00:00.000Z'),
+      freezes: [
+        {
+          id: 'freeze-1',
+          startsAt: new Date('2026-05-04T00:00:00.000Z'),
+          endsAt: new Date('2026-05-11T00:00:00.000Z'),
+          daysUsed: 7,
+          status: 'ACTIVE',
+          createdAt: new Date('2026-05-04T00:00:00.000Z'),
+          updatedAt: new Date('2026-05-04T00:00:00.000Z'),
+        },
+      ],
+    });
+    prismaService.userMembership.findMany.mockResolvedValue([membershipRecord]);
+
+    await membershipsService.unfreezeMembershipForUser('user-1', 'membership-1');
+
+    expect(prismaService.userMembershipFreeze.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'freeze-1' },
+        data: expect.objectContaining({
+          status: 'COMPLETED',
+          daysUsed: 1,
+        }),
+      }),
+    );
+    expect(prismaService.userMembership.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'membership-1' },
+        data: expect.objectContaining({
+          status: 'ACTIVE',
+          endsAt: new Date('2026-05-13T00:00:00.000Z'),
+          freezeDaysUsed: 1,
+        }),
+      }),
+    );
   });
 
   it('creates membership from admin payload', async () => {

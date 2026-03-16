@@ -3,7 +3,6 @@ import { CurrentUser } from '../common/auth/current-user.decorator';
 import { AuthenticatedGuard } from '../common/auth/authenticated.guard';
 import type { SessionUser } from '../common/auth/session-user.interface';
 import { CreateMembershipFreezeDto } from './dto/create-membership-freeze.dto';
-import { CreateMembershipRenewalDto } from './dto/create-membership-renewal.dto';
 import { MembershipsService } from './memberships.service';
 
 @Controller('memberships')
@@ -29,16 +28,14 @@ export class MembershipsController {
     );
   }
 
-  @Post(':id/renew')
-  renewMembership(
+  @Post(':id/unfreeze')
+  unfreezeMembership(
     @CurrentUser() currentUser: SessionUser,
     @Param('id') membershipId: string,
-    @Body() dto: CreateMembershipRenewalDto,
   ) {
-    return this.membershipsService.requestRenewal(
+    return this.membershipsService.unfreezeMembershipForUser(
       currentUser.userId,
       membershipId,
-      dto,
     );
   }
 }

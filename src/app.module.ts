@@ -9,6 +9,7 @@ import { AuthModule } from './auth/auth.module';
 import { MembershipsModule } from './memberships/memberships.module';
 import { UsersModule } from './users/users.module';
 import { PassesModule } from './passes/passes.module';
+import { ScheduleModule } from './schedule/schedule.module';
 
 @Module({
   imports: [
@@ -26,6 +27,7 @@ import { PassesModule } from './passes/passes.module';
     AuthModule,
     PassesModule,
     MembershipsModule,
+    ScheduleModule,
   ],
   controllers: [AppController],
   providers: [AppService],

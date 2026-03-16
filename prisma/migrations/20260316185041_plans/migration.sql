@@ -1,0 +1,2 @@
+-- RenameIndex
+ALTER INDEX "ScheduleDateOverrideSlot_overrideId_isActive_sortOrder_startTim" RENAME TO "ScheduleDateOverrideSlot_overrideId_isActive_sortOrder_star_idx";
