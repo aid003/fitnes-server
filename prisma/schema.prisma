@@ -55,6 +55,16 @@ enum MembershipRenewalStatus {
   CANCELLED
 }
 
+enum PaymentOrderStatus {
+  CREATED
+  FORM_REGISTERED
+  REDIRECTED
+  PAID
+  FAILED
+  EXPIRED
+  CANCELLED
+}
+
 enum ScheduleWeekday {
   MONDAY
   TUESDAY
@@ -77,6 +87,7 @@ model User {
   emailLoginChallenges EmailLoginChallenge[]
   memberships         UserMembership[]
   membershipRenewalRequests UserMembershipRenewalRequest[]
+  paymentOrders       PaymentOrder[]
 }
 
 model EmailLoginChallenge {
@@ -165,6 +176,7 @@ model PassPlan {
   badges          PassBadge[]
   features        PassFeature[]
   memberships     UserMembership[]
+  paymentOrders   PaymentOrder[]
 
   @@unique([groupId, slug])
   @@index([groupId, isActive, sortOrder])
@@ -190,6 +202,7 @@ model UserMembership {
   passPlan              PassPlan                       @relation(fields: [passPlanId], references: [id], onDelete: Restrict)
   freezes               UserMembershipFreeze[]
   renewalRequests       UserMembershipRenewalRequest[]
+  paymentOrders         PaymentOrder[]
 
   @@index([userId, status, startsAt])
   @@index([passPlanId])
@@ -222,6 +235,44 @@ model UserMembershipRenewalRequest {
 
   @@index([membershipId, status, createdAt])
   @@index([userId, status, createdAt])
+}
+
+model PaymentOrder {
+  id                    String             @id @default(cuid())
+  userId                String
+  passPlanId            String
+  membershipId          String?
+  merchantOrderNumber   String             @unique
+  gatewayOrderId        String?            @unique
+  amount                Int
+  currency              String             @default("RUB")
+  status                PaymentOrderStatus @default(CREATED)
+  gatewayOrderStatus    Int?
+  gatewayPaymentState   String?
+  actionCode            Int?
+  actionCodeDescription String?
+  formUrl               String?
+  returnUrl             String
+  failUrl               String
+  planTitle             String
+  planSubtitle          String?
+  planDescription       String?
+  payerEmail            String?
+  payerPhone            String?
+  fiscalPayload         Json?
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+  redirectedAt          DateTime?
+  paidAt                DateTime?
+  failedAt              DateTime?
+  membershipIssuedAt    DateTime?
+  user                  User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  passPlan              PassPlan           @relation(fields: [passPlanId], references: [id], onDelete: Restrict)
+  membership            UserMembership?    @relation(fields: [membershipId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([passPlanId, createdAt])
+  @@index([status, createdAt])
 }
 
 model ScheduleTemplateSlot {

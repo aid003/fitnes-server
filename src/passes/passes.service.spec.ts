@@ -41,14 +41,61 @@ describe('PassesService', () => {
         update: jest.fn(),
         delete: jest.fn(),
       },
+      passFeature: {
+        findUnique: jest.fn(),
+        create: jest.fn(),
+        update: jest.fn(),
+        delete: jest.fn(),
+      },
     };
 
     passesService = new PassesService(prismaService as PrismaService);
   });
 
+  it('does not seed catalog when categories already exist', async () => {
+    prismaService.passCategory.count.mockResolvedValue(1);
+
+    await passesService.onModuleInit();
+
+    expect(prismaService.passCategory.create).not.toHaveBeenCalled();
+  });
+
+  it('seeds full catalog when categories table is empty', async () => {
+    prismaService.passCategory.count.mockResolvedValue(0);
+
+    await passesService.onModuleInit();
+
+    expect(prismaService.passCategory.create).toHaveBeenCalledTimes(6);
+
+    const [firstCall] = prismaService.passCategory.create.mock.calls;
+    expect(firstCall[0].data.slug).toBe('unlimited-daily');
+    expect(firstCall[0].data.variants.create[0].groups.create).toHaveLength(5);
+
+    const createdCategorySlugs =
+      prismaService.passCategory.create.mock.calls.map(
+        ([argument]: Array<{ data: { slug: string } }>) => argument.data.slug,
+      );
+
+    expect(createdCategorySlugs).toEqual([
+      'unlimited-daily',
+      'best-hours',
+      'kids-sections',
+      'adult-group-classes',
+      'teen-membership',
+      'personal-training',
+    ]);
+  });
+
   it('lists only active public categories ordered by sort order', async () => {
     prismaService.passCategory.findMany.mockResolvedValue([
-      { id: 'cat-1', title: 'Unlimited', slug: 'unlimited', coverImageUrl: null, isActive: true, sortOrder: 0 },
+      {
+        id: 'cat-1',
+        title: 'Unlimited',
+        slug: 'unlimited',
+        coverImageUrl: null,
+        isActive: true,
+        sortOrder: 0,
+      },
     ]);
 
     const result = await passesService.listPublicCategories();
@@ -102,7 +149,14 @@ describe('PassesService', () => {
                   highlightStyle: null,
                   sortOrder: 0,
                   isActive: true,
-                  badges: [{ id: 'badge-1', label: '+2 дня', style: 'gift', sortOrder: 0 }],
+                  badges: [
+                    {
+                      id: 'badge-1',
+                      label: '+2 дня',
+                      style: 'gift',
+                      sortOrder: 0,
+                    },
+                  ],
                 },
               ],
             },
@@ -114,7 +168,9 @@ describe('PassesService', () => {
     const result = await passesService.getPublicCategoryBySlug('unlimited');
 
     expect(result.slug).toBe('unlimited');
-    expect(result.variants[0]?.groups[0]?.plans[0]?.badges[0]?.label).toBe('+2 дня');
+    expect(result.variants[0]?.groups[0]?.plans[0]?.badges[0]?.label).toBe(
+      '+2 дня',
+    );
   });
 
   it('rejects update when category does not exist', async () => {

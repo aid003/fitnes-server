@@ -5,6 +5,8 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  BillingType,
+  DurationUnit,
   MembershipFreezeStatus,
   MembershipStatus,
   Prisma,
@@ -88,6 +90,57 @@ type MembershipRecord = Prisma.UserMembershipGetPayload<{
 @Injectable()
 export class MembershipsService {
   constructor(private readonly prisma: PrismaService) {}
+
+  async issueMembershipFromPayment(input: {
+    userId: string;
+    passPlanId: string;
+    paidAt?: Date;
+    title?: string;
+    subtitle?: string | null;
+    description?: string | null;
+    freezeDaysLimit?: number;
+  }) {
+    await this.ensureUserExists(input.userId);
+
+    const passPlan = await this.prisma.passPlan.findUnique({
+      where: { id: input.passPlanId },
+      select: {
+        id: true,
+        title: true,
+        subtitle: true,
+        description: true,
+        durationValue: true,
+        durationUnit: true,
+        billingType: true,
+      },
+    });
+
+    if (!passPlan) {
+      throw new NotFoundException('Pass plan not found');
+    }
+
+    const startsAt = input.paidAt ?? new Date();
+    const endsAt = calculateMembershipEndsAt(startsAt, passPlan);
+
+    return this.prisma.userMembership.create({
+      data: {
+        userId: input.userId,
+        passPlanId: input.passPlanId,
+        title: input.title?.trim() || passPlan.title,
+        subtitle: input.subtitle?.trim() || passPlan.subtitle || undefined,
+        description: input.description?.trim() || passPlan.description || undefined,
+        startsAt,
+        endsAt,
+        status: endsAt <= new Date() ? MembershipStatus.EXPIRED : MembershipStatus.ACTIVE,
+        freezeDaysLimit: input.freezeDaysLimit ?? 0,
+        canRenew: true,
+        sortOrder: 0,
+      },
+      select: {
+        id: true,
+      },
+    });
+  }
 
   async getMyMemberships(userId: string) {
     await this.ensureUserExists(userId);
@@ -721,4 +774,54 @@ function parseDate(value: string, fieldName: string) {
   }
 
   return parsed;
+}
+
+function calculateMembershipEndsAt(
+  startsAt: Date,
+  passPlan: {
+    durationValue: number | null;
+    durationUnit: DurationUnit | null;
+    billingType: BillingType | null;
+  },
+) {
+  if (passPlan.durationValue && passPlan.durationUnit) {
+    return addDuration(startsAt, passPlan.durationValue, passPlan.durationUnit);
+  }
+
+  if (passPlan.billingType === BillingType.SINGLE_VISIT) {
+    return addDays(startsAt, 1);
+  }
+
+  if (passPlan.billingType === BillingType.VISIT_PACK) {
+    return addMonths(startsAt, 1);
+  }
+
+  return addMonths(startsAt, 1);
+}
+
+function addDuration(date: Date, value: number, unit: DurationUnit) {
+  switch (unit) {
+    case DurationUnit.DAY:
+      return addDays(date, value);
+    case DurationUnit.WEEK:
+      return addDays(date, value * 7);
+    case DurationUnit.MONTH:
+      return addMonths(date, value);
+    case DurationUnit.YEAR:
+      return addYears(date, value);
+  }
+}
+
+function addMonths(date: Date, months: number) {
+  const nextDate = new Date(date);
+  nextDate.setMonth(nextDate.getMonth() + months);
+
+  return nextDate;
+}
+
+function addYears(date: Date, years: number) {
+  const nextDate = new Date(date);
+  nextDate.setFullYear(nextDate.getFullYear() + years);
+
+  return nextDate;
 }

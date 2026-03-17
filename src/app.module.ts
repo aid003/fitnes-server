@@ -10,6 +10,7 @@ import { MembershipsModule } from './memberships/memberships.module';
 import { UsersModule } from './users/users.module';
 import { PassesModule } from './passes/passes.module';
 import { ScheduleModule } from './schedule/schedule.module';
+import { PaymentsModule } from './payments/payments.module';
 
 @Module({
   imports: [
@@ -28,6 +29,7 @@ import { ScheduleModule } from './schedule/schedule.module';
     PassesModule,
     MembershipsModule,
     ScheduleModule,
+    PaymentsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
