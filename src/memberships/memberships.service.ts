@@ -9,12 +9,17 @@ import {
   DurationUnit,
   MembershipFreezeStatus,
   MembershipStatus,
+  PaymentOrderStatus,
   Prisma,
 } from '@prisma/client';
 import { handlePrismaError } from '../common/database/prisma-errors';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateMembershipDto } from './dto/create-membership.dto';
 import { CreateMembershipFreezeDto } from './dto/create-membership-freeze.dto';
+import {
+  MembershipQrPayload,
+  MembershipQrService,
+} from './membership-qr.service';
 import { UpdateMembershipDto } from './dto/update-membership.dto';
 
 const DAY_IN_MS = 24 * 60 * 60 * 1000;
@@ -33,6 +38,7 @@ const membershipSelect = {
   freezeDaysUsed: true,
   canRenew: true,
   sortOrder: true,
+  qrGeneratedAt: true,
   createdAt: true,
   updatedAt: true,
   user: {
@@ -89,7 +95,10 @@ type MembershipRecord = Prisma.UserMembershipGetPayload<{
 
 @Injectable()
 export class MembershipsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly membershipQrService: MembershipQrService,
+  ) {}
 
   async issueMembershipFromPayment(input: {
     userId: string;
@@ -128,10 +137,14 @@ export class MembershipsService {
         passPlanId: input.passPlanId,
         title: input.title?.trim() || passPlan.title,
         subtitle: input.subtitle?.trim() || passPlan.subtitle || undefined,
-        description: input.description?.trim() || passPlan.description || undefined,
+        description:
+          input.description?.trim() || passPlan.description || undefined,
         startsAt,
         endsAt,
-        status: endsAt <= new Date() ? MembershipStatus.EXPIRED : MembershipStatus.ACTIVE,
+        status:
+          endsAt <= new Date()
+            ? MembershipStatus.EXPIRED
+            : MembershipStatus.ACTIVE,
         freezeDaysLimit: input.freezeDaysLimit ?? 0,
         canRenew: true,
         sortOrder: 0,
@@ -148,7 +161,11 @@ export class MembershipsService {
     const memberships = await this.prisma.userMembership.findMany({
       where: { userId },
       select: membershipSelect,
-      orderBy: [{ sortOrder: 'asc' }, { startsAt: 'desc' }, { createdAt: 'desc' }],
+      orderBy: [
+        { sortOrder: 'asc' },
+        { startsAt: 'desc' },
+        { createdAt: 'desc' },
+      ],
     });
 
     const synced = await this.syncMembershipStates(memberships);
@@ -162,6 +179,208 @@ export class MembershipsService {
     return {
       activeMemberships,
       completedMemberships,
+    };
+  }
+
+  async getMembershipQr(userId: string, membershipId: string) {
+    const membership = await this.prisma.userMembership.findFirst({
+      where: {
+        id: membershipId,
+        userId,
+      },
+      select: {
+        id: true,
+        qrCodeSvg: true,
+        qrGeneratedAt: true,
+        qrPayload: true,
+      },
+    });
+
+    if (!membership) {
+      throw new ForbiddenException('Membership is unavailable');
+    }
+
+    if (
+      !membership.qrCodeSvg ||
+      !membership.qrGeneratedAt ||
+      !membership.qrPayload
+    ) {
+      throw new NotFoundException(
+        'QR code is not available for this membership',
+      );
+    }
+
+    const payload = membership.qrPayload as MembershipQrPayload;
+
+    return {
+      membershipId: membership.id,
+      qrCodeSvg: membership.qrCodeSvg,
+      generatedAt: membership.qrGeneratedAt.toISOString(),
+      payloadSummary: {
+        customerName: payload.user.name,
+        customerEmail: payload.user.email,
+        planTitle: payload.plan.title,
+        planSubtitle: payload.plan.subtitle,
+        amount: payload.payment.amount,
+        currency: payload.payment.currency,
+        paidAt: payload.payment.paidAt,
+        merchantOrderNumber: payload.payment.merchantOrderNumber,
+        expiresAt: payload.membership.endsAt,
+      },
+    };
+  }
+
+  async attachQrSnapshotFromPayment(
+    membershipId: string,
+    paymentOrderId: string,
+  ) {
+    const paymentOrder = await this.prisma.paymentOrder.findUnique({
+      where: { id: paymentOrderId },
+      select: {
+        id: true,
+        merchantOrderNumber: true,
+        gatewayOrderId: true,
+        status: true,
+        amount: true,
+        currency: true,
+        createdAt: true,
+        paidAt: true,
+        membershipIssuedAt: true,
+        actionCode: true,
+        actionCodeDescription: true,
+        planTitle: true,
+        planSubtitle: true,
+        planDescription: true,
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+          },
+        },
+        passPlan: {
+          select: {
+            id: true,
+            title: true,
+            subtitle: true,
+            description: true,
+            billingType: true,
+            durationValue: true,
+            durationUnit: true,
+          },
+        },
+      },
+    });
+
+    const membership = await this.prisma.userMembership.findUnique({
+      where: { id: membershipId },
+      select: {
+        id: true,
+        title: true,
+        subtitle: true,
+        status: true,
+        startsAt: true,
+        endsAt: true,
+        freezeDaysLimit: true,
+        qrGeneratedAt: true,
+      },
+    });
+
+    if (!paymentOrder || !membership) {
+      throw new NotFoundException('Membership or payment order not found');
+    }
+
+    if (paymentOrder.status !== PaymentOrderStatus.PAID) {
+      throw new BadRequestException(
+        'QR code is available only for paid orders',
+      );
+    }
+
+    if (membership.qrGeneratedAt) {
+      return;
+    }
+
+    const generatedAt = new Date();
+    const payload: MembershipQrPayload = {
+      membershipId: membership.id,
+      user: {
+        id: paymentOrder.user.id,
+        name: paymentOrder.user.name,
+        email: paymentOrder.user.email,
+      },
+      membership: {
+        title: membership.title,
+        subtitle: membership.subtitle,
+        status: membership.status,
+        startsAt: membership.startsAt.toISOString(),
+        endsAt: membership.endsAt.toISOString(),
+        freezeDaysLimit: membership.freezeDaysLimit,
+      },
+      plan: {
+        id: paymentOrder.passPlan.id,
+        title: paymentOrder.passPlan.title ?? paymentOrder.planTitle,
+        subtitle: paymentOrder.passPlan.subtitle ?? paymentOrder.planSubtitle,
+        description:
+          paymentOrder.passPlan.description ?? paymentOrder.planDescription,
+        billingType: paymentOrder.passPlan.billingType,
+        durationValue: paymentOrder.passPlan.durationValue,
+        durationUnit: paymentOrder.passPlan.durationUnit,
+      },
+      payment: {
+        paymentId: paymentOrder.id,
+        merchantOrderNumber: paymentOrder.merchantOrderNumber,
+        gatewayOrderId: paymentOrder.gatewayOrderId,
+        status: paymentOrder.status,
+        amount: paymentOrder.amount,
+        currency: paymentOrder.currency,
+        createdAt: paymentOrder.createdAt.toISOString(),
+        paidAt: paymentOrder.paidAt?.toISOString() ?? null,
+        membershipIssuedAt:
+          paymentOrder.membershipIssuedAt?.toISOString() ?? null,
+        actionCode: paymentOrder.actionCode,
+        actionCodeDescription: paymentOrder.actionCodeDescription,
+      },
+      generatedAt: generatedAt.toISOString(),
+    };
+    const envelope = await this.membershipQrService.createEnvelope(payload);
+
+    await this.prisma.userMembership.update({
+      where: { id: membershipId },
+      data: {
+        qrPayload: payload,
+        qrSignature: envelope.signature,
+        qrCodeSvg: envelope.qrCodeSvg,
+        qrGeneratedAt: generatedAt,
+      },
+    });
+  }
+
+  scanMembershipQr(content: string) {
+    const envelope = this.membershipQrService.parseAndVerify(content);
+    const payload = envelope.payload;
+
+    return {
+      customer: {
+        id: payload.user.id,
+        name: payload.user.name,
+        email: payload.user.email,
+      },
+      membership: {
+        id: payload.membershipId,
+        title: payload.membership.title,
+        subtitle: payload.membership.subtitle,
+        status: payload.membership.status,
+        startsAt: payload.membership.startsAt,
+        endsAt: payload.membership.endsAt,
+        freezeDaysLimit: payload.membership.freezeDaysLimit,
+      },
+      plan: payload.plan,
+      payment: payload.payment,
+      verification: {
+        isSignatureValid: true,
+        version: envelope.version,
+        generatedAt: payload.generatedAt,
+      },
     };
   }
 
@@ -256,7 +475,10 @@ export class MembershipsService {
     }
 
     const status =
-      dto.status ?? (endsAt <= new Date() ? MembershipStatus.EXPIRED : MembershipStatus.ACTIVE);
+      dto.status ??
+      (endsAt <= new Date()
+        ? MembershipStatus.EXPIRED
+        : MembershipStatus.ACTIVE);
 
     try {
       await this.prisma.userMembership.create({
@@ -265,7 +487,8 @@ export class MembershipsService {
           passPlanId: dto.passPlanId,
           title: dto.title?.trim() || passPlan.title,
           subtitle: dto.subtitle?.trim() || passPlan.subtitle || undefined,
-          description: dto.description?.trim() || passPlan.description || undefined,
+          description:
+            dto.description?.trim() || passPlan.description || undefined,
           startsAt,
           endsAt,
           status,
@@ -313,7 +536,9 @@ export class MembershipsService {
 
     if (dto.freezeDaysLimit !== undefined) {
       if (dto.freezeDaysLimit < membership.freezeDaysUsed) {
-        throw new BadRequestException('freezeDaysLimit cannot be less than used days');
+        throw new BadRequestException(
+          'freezeDaysLimit cannot be less than used days',
+        );
       }
 
       data.freezeDaysLimit = dto.freezeDaysLimit;
@@ -339,7 +564,8 @@ export class MembershipsService {
       data.description = dto.description.trim() || null;
     }
 
-    const nextStartsAt = (data.startsAt as Date | undefined) ?? membership.startsAt;
+    const nextStartsAt =
+      (data.startsAt as Date | undefined) ?? membership.startsAt;
     const nextEndsAt = (data.endsAt as Date | undefined) ?? membership.endsAt;
 
     if (nextStartsAt >= nextEndsAt) {
@@ -436,7 +662,9 @@ export class MembershipsService {
 
     if (activeFreeze && activeFreeze.endsAt <= now) {
       const nextStatus =
-        membership.endsAt <= now ? MembershipStatus.EXPIRED : MembershipStatus.ACTIVE;
+        membership.endsAt <= now
+          ? MembershipStatus.EXPIRED
+          : MembershipStatus.ACTIVE;
 
       await this.prisma.$transaction([
         this.prisma.userMembershipFreeze.update({
@@ -458,7 +686,9 @@ export class MembershipsService {
 
     if (!activeFreeze && membership.status === MembershipStatus.FROZEN) {
       const nextStatus =
-        membership.endsAt <= now ? MembershipStatus.EXPIRED : MembershipStatus.ACTIVE;
+        membership.endsAt <= now
+          ? MembershipStatus.EXPIRED
+          : MembershipStatus.ACTIVE;
 
       await this.prisma.userMembership.update({
         where: { id: membership.id },
@@ -470,7 +700,10 @@ export class MembershipsService {
       return this.getMembershipById(membership.id);
     }
 
-    if (membership.status !== MembershipStatus.EXPIRED && membership.endsAt <= now) {
+    if (
+      membership.status !== MembershipStatus.EXPIRED &&
+      membership.endsAt <= now
+    ) {
       await this.prisma.userMembership.update({
         where: { id: membership.id },
         data: {
@@ -537,7 +770,8 @@ export class MembershipsService {
       membership.freezeDaysLimit - membership.freezeDaysUsed,
     );
     const daysLeft = getDaysLeft(membership.endsAt);
-    const renewalAvailable = membership.canRenew && canRequestRenewalNow(membership);
+    const renewalAvailable =
+      membership.canRenew && canRequestRenewalNow(membership);
     const status = getStatusMeta(membership.status, renewalAvailable);
 
     return {
@@ -562,10 +796,13 @@ export class MembershipsService {
         membership.status === MembershipStatus.ACTIVE &&
         freezeDaysLeft > 0 &&
         !getActiveFreeze(membership),
-      canUnfreeze: membership.status === MembershipStatus.FROZEN && Boolean(getActiveFreeze(membership)),
+      canUnfreeze:
+        membership.status === MembershipStatus.FROZEN &&
+        Boolean(getActiveFreeze(membership)),
       canRenew: membership.canRenew,
       canRequestRenewalNow: renewalAvailable,
       scheduleAvailable: false,
+      hasQr: Boolean(membership.qrGeneratedAt),
       history: buildMembershipHistory(membership),
     };
   }
@@ -582,6 +819,7 @@ export class MembershipsService {
       statusLabel: status.label,
       statusTone: status.tone,
       expiresAt: membership.endsAt.toISOString(),
+      hasQr: Boolean(membership.qrGeneratedAt),
       history: buildMembershipHistory(membership),
       features: membership.passPlan.features.map((feature) => ({
         id: feature.id,
@@ -717,7 +955,9 @@ function canRequestRenewalNow(
     return false;
   }
 
-  return membership.endsAt.getTime() - Date.now() <= RENEWAL_WINDOW_DAYS * DAY_IN_MS;
+  return (
+    membership.endsAt.getTime() - Date.now() <= RENEWAL_WINDOW_DAYS * DAY_IN_MS
+  );
 }
 
 function getDaysLeft(endsAt: Date) {
@@ -736,7 +976,8 @@ function getActiveFreeze(membership: Pick<MembershipRecord, 'freezes'>) {
   return membership.freezes.find(
     (freeze) =>
       freeze.status === MembershipFreezeStatus.ACTIVE ||
-      (freeze.status !== MembershipFreezeStatus.CANCELLED && freeze.endsAt > now),
+      (freeze.status !== MembershipFreezeStatus.CANCELLED &&
+        freeze.endsAt > now),
   );
 }
 

@@ -15,6 +15,17 @@ export class MembershipsController {
     return this.membershipsService.getMyMemberships(currentUser.userId);
   }
 
+  @Get(':id/qr')
+  getMembershipQr(
+    @CurrentUser() currentUser: SessionUser,
+    @Param('id') membershipId: string,
+  ) {
+    return this.membershipsService.getMembershipQr(
+      currentUser.userId,
+      membershipId,
+    );
+  }
+
   @Post(':id/freeze')
   freezeMembership(
     @CurrentUser() currentUser: SessionUser,

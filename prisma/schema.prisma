@@ -196,6 +196,10 @@ model UserMembership {
   freezeDaysUsed        Int                            @default(0)
   canRenew              Boolean                        @default(true)
   sortOrder             Int                            @default(0)
+  qrPayload             Json?
+  qrSignature           String?
+  qrCodeSvg             String?
+  qrGeneratedAt         DateTime?
   createdAt             DateTime                       @default(now())
   updatedAt             DateTime                       @updatedAt
   user                  User                           @relation(fields: [userId], references: [id], onDelete: Cascade)

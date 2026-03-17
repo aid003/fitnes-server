@@ -5,10 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import {
-  PaymentOrderStatus,
-  Prisma,
-} from '@prisma/client';
+import { PaymentOrderStatus, Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { MembershipsService } from '../memberships/memberships.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -166,7 +163,9 @@ export class PaymentsService {
           status: PaymentOrderStatus.FAILED,
           failedAt: new Date(),
           actionCodeDescription:
-            error instanceof Error ? error.message : 'Payment registration failed',
+            error instanceof Error
+              ? error.message
+              : 'Payment registration failed',
         },
       });
 
@@ -226,7 +225,9 @@ export class PaymentsService {
       return this.mapPaymentStatus(payment);
     }
 
-    const statusResponse = await this.fetchGatewayStatus(payment.gatewayOrderId);
+    const statusResponse = await this.fetchGatewayStatus(
+      payment.gatewayOrderId,
+    );
     const nextState = resolvePaymentState(statusResponse, payment);
 
     const synced = await this.prisma.paymentOrder.update({
@@ -237,8 +238,7 @@ export class PaymentsService {
         gatewayPaymentState: nextState.gatewayPaymentState,
         actionCode: nextState.actionCode,
         actionCodeDescription: nextState.actionCodeDescription,
-        redirectedAt:
-          payment.redirectedAt ?? new Date(),
+        redirectedAt: payment.redirectedAt ?? new Date(),
         paidAt: nextState.paidAt ?? payment.paidAt,
         failedAt: nextState.failedAt ?? payment.failedAt,
       },
@@ -248,14 +248,15 @@ export class PaymentsService {
     let finalPayment = synced;
 
     if (shouldIssueMembership(synced)) {
-      const membership = await this.membershipsService.issueMembershipFromPayment({
-        userId: synced.userId,
-        passPlanId: synced.passPlanId,
-        paidAt: synced.paidAt ?? new Date(),
-        title: synced.planTitle,
-        subtitle: synced.planSubtitle,
-        description: synced.planDescription,
-      });
+      const membership =
+        await this.membershipsService.issueMembershipFromPayment({
+          userId: synced.userId,
+          passPlanId: synced.passPlanId,
+          paidAt: synced.paidAt ?? new Date(),
+          title: synced.planTitle,
+          subtitle: synced.planSubtitle,
+          description: synced.planDescription,
+        });
 
       finalPayment = await this.prisma.paymentOrder.update({
         where: { id: synced.id },
@@ -265,6 +266,19 @@ export class PaymentsService {
         },
         select: paymentSelect,
       });
+
+      await this.membershipsService.attachQrSnapshotFromPayment(
+        membership.id,
+        finalPayment.id,
+      );
+    } else if (
+      synced.status === PaymentOrderStatus.PAID &&
+      synced.membershipId
+    ) {
+      await this.membershipsService.attachQrSnapshotFromPayment(
+        synced.membershipId,
+        synced.id,
+      );
     }
 
     return this.mapPaymentStatus(finalPayment);
@@ -315,7 +329,10 @@ export class PaymentsService {
     });
   }
 
-  private async callAlfa<T>(method: string, params: Record<string, string | undefined>) {
+  private async callAlfa<T>(
+    method: string,
+    params: Record<string, string | undefined>,
+  ) {
     const baseUrl = this.configService.get<string>('ALFA_GATEWAY_BASE_URL');
     const userName = this.configService.get<string>('ALFA_GATEWAY_USERNAME');
     const password = this.configService.get<string>('ALFA_GATEWAY_PASSWORD');
@@ -352,7 +369,9 @@ export class PaymentsService {
   }
 
   private resolveSessionTimeoutSecs() {
-    const rawValue = this.configService.get<string>('PAYMENT_SESSION_TIMEOUT_SECS');
+    const rawValue = this.configService.get<string>(
+      'PAYMENT_SESSION_TIMEOUT_SECS',
+    );
     const parsed = rawValue ? Number(rawValue) : NaN;
 
     if (Number.isFinite(parsed) && parsed > 0) {
@@ -401,7 +420,9 @@ export class PaymentsService {
       actionCodeDescription: payment.actionCodeDescription,
       membershipId: payment.membershipId,
       membershipIssuedAt: payment.membershipIssuedAt?.toISOString() ?? null,
-      canRetry: payment.status === PaymentOrderStatus.FAILED || payment.status === PaymentOrderStatus.EXPIRED,
+      canRetry:
+        payment.status === PaymentOrderStatus.FAILED ||
+        payment.status === PaymentOrderStatus.EXPIRED,
       isFinal:
         payment.status === PaymentOrderStatus.PAID ||
         payment.status === PaymentOrderStatus.FAILED ||
@@ -437,9 +458,13 @@ function normalizeNullableNumber(value: string | number | undefined) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function resolvePaymentState(statusResponse: AlfaStatusResponse, payment: PaymentRecord) {
+function resolvePaymentState(
+  statusResponse: AlfaStatusResponse,
+  payment: PaymentRecord,
+) {
   const errorCode = normalizeNumeric(statusResponse.errorCode);
-  const orderStatus = statusResponse.orderStatus ?? payment.gatewayOrderStatus ?? null;
+  const orderStatus =
+    statusResponse.orderStatus ?? payment.gatewayOrderStatus ?? null;
   const paymentState = statusResponse.paymentAmountInfo?.paymentState ?? null;
   const actionCode = normalizeNullableNumber(statusResponse.actionCode);
   const actionCodeDescription =
@@ -448,10 +473,7 @@ function resolvePaymentState(statusResponse: AlfaStatusResponse, payment: Paymen
     payment.actionCodeDescription ??
     null;
 
-  if (
-    errorCode === 0 &&
-    (orderStatus === 2 || paymentState === 'DEPOSITED')
-  ) {
+  if (errorCode === 0 && (orderStatus === 2 || paymentState === 'DEPOSITED')) {
     return {
       status: PaymentOrderStatus.PAID,
       gatewayOrderStatus: orderStatus,
@@ -524,7 +546,9 @@ function isExpiredStatus(statusResponse: AlfaStatusResponse) {
 }
 
 function shouldIssueMembership(payment: PaymentRecord) {
-  return payment.status === PaymentOrderStatus.PAID && !payment.membershipIssuedAt;
+  return (
+    payment.status === PaymentOrderStatus.PAID && !payment.membershipIssuedAt
+  );
 }
 
 function getPaymentStatusMeta(status: PaymentOrderStatus) {
@@ -539,13 +563,15 @@ function getPaymentStatusMeta(status: PaymentOrderStatus) {
       return {
         label: 'Время оплаты истекло',
         tone: 'warning',
-        message: 'Сессия оплаты истекла. Создайте новый платёж и повторите попытку.',
+        message:
+          'Сессия оплаты истекла. Создайте новый платёж и повторите попытку.',
       };
     case PaymentOrderStatus.FAILED:
       return {
         label: 'Оплата не прошла',
         tone: 'danger',
-        message: 'Банк не подтвердил оплату. Проверьте данные карты и повторите попытку.',
+        message:
+          'Банк не подтвердил оплату. Проверьте данные карты и повторите попытку.',
       };
     case PaymentOrderStatus.CANCELLED:
       return {

@@ -1,10 +1,4 @@
-import {
-  Controller,
-  Get,
-  Param,
-  Post,
-  UseGuards,
-} from '@nestjs/common';
+import { Controller, Get, Param, Post, UseGuards } from '@nestjs/common';
 import { AuthenticatedGuard } from '../common/auth/authenticated.guard';
 import { CurrentUser } from '../common/auth/current-user.decorator';
 import type { SessionUser } from '../common/auth/session-user.interface';
