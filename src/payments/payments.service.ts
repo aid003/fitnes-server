@@ -190,7 +190,10 @@ export class PaymentsService {
       });
 
       throw new BadGatewayException(
-        registerResponse.errorMessage ?? 'Payment registration failed',
+        mapGatewayRegistrationError(
+          registerResponse.errorCode,
+          registerResponse.errorMessage,
+        ),
       );
     }
 
@@ -564,4 +567,21 @@ function getPaymentStatusMeta(status: PaymentOrderStatus) {
         message: 'Переходим к оплате через банковский шлюз.',
       };
   }
+}
+
+function mapGatewayRegistrationError(
+  errorCode: string | number | undefined,
+  errorMessage: string | undefined,
+) {
+  const normalizedMessage = (errorMessage ?? '').toLowerCase();
+
+  if (
+    normalizeNumeric(errorCode) === 5 &&
+    (normalizedMessage.includes('access denied') ||
+      normalizedMessage.includes('доступ запрещ'))
+  ) {
+    return 'Платёжный шлюз отклонил доступ. Проверьте API-логин, пароль и обязательно смените временный пароль Alfa.';
+  }
+
+  return errorMessage ?? 'Payment registration failed';
 }
