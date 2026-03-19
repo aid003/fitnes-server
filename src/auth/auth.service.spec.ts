@@ -5,9 +5,10 @@ import {
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { UserRole } from '@prisma/client';
+import { EmailChallengePurpose, UserRole } from '@prisma/client';
 import type { Request } from 'express';
 import { PasswordService } from '../common/security/password.service';
+import { MailService } from '../mail/mail.service';
 import { PrismaService } from '../prisma/prisma.service';
 import type { PublicUser } from '../users/users.service';
 import { UsersService } from '../users/users.service';
@@ -27,15 +28,21 @@ describe('AuthService', () => {
   };
   let prismaService: {
     emailLoginChallenge: {
-      create: jest.Mock;
+      delete: jest.Mock;
       deleteMany: jest.Mock;
-      findFirst: jest.Mock;
+      findUnique: jest.Mock;
+      upsert: jest.Mock;
       update: jest.Mock;
     };
     user: {
+      create: jest.Mock;
       update: jest.Mock;
     };
     $transaction: jest.Mock;
+  };
+  let mailService: {
+    sendRegistrationCode: jest.Mock;
+    sendPasswordRecoveryCode: jest.Mock;
   };
 
   beforeEach(() => {
@@ -53,30 +60,50 @@ describe('AuthService', () => {
 
     prismaService = {
       emailLoginChallenge: {
-        create: jest.fn(),
+        delete: jest.fn(),
         deleteMany: jest.fn(),
-        findFirst: jest.fn(),
+        findUnique: jest.fn(),
+        upsert: jest.fn(),
         update: jest.fn(),
       },
       user: {
+        create: jest.fn(),
         update: jest.fn(),
       },
-      $transaction: jest.fn().mockImplementation(async (operations) => Promise.all(operations)),
+      $transaction: jest
+        .fn()
+        .mockImplementation(async (input) =>
+          typeof input === 'function'
+            ? input({
+                emailLoginChallenge: prismaService.emailLoginChallenge,
+                user: prismaService.user,
+              })
+            : Promise.all(input),
+        ),
+    };
+
+    mailService = {
+      sendRegistrationCode: jest.fn(),
+      sendPasswordRecoveryCode: jest.fn(),
     };
 
     authService = new AuthService(
       usersService as unknown as UsersService,
       passwordService as unknown as PasswordService,
       prismaService as unknown as PrismaService,
+      mailService as unknown as MailService,
     );
   });
 
-  it('registers a user with hashed password and session', async () => {
-    const request = createRequest();
-
+  it('creates an inactive user and sends a registration code', async () => {
     usersService.findByEmail.mockResolvedValue(null);
     passwordService.hash.mockResolvedValue('hashed-password');
-    usersService.createUser.mockResolvedValue(createPublicUser());
+    prismaService.emailLoginChallenge.findUnique.mockResolvedValue(null);
+    prismaService.user.create.mockResolvedValue({
+      id: 'user-1',
+      email: 'test@example.com',
+      name: 'Test User',
+    });
 
     const result = await authService.register(
       {
@@ -84,22 +111,31 @@ describe('AuthService', () => {
         email: 'test@example.com',
         password: 'password123',
       },
-      request,
     );
 
     expect(passwordService.hash.mock.calls[0]).toEqual(['password123']);
-    expect(usersService.createUser.mock.calls[0]).toEqual([
-      {
+    expect(prismaService.user.create).toHaveBeenCalledWith({
+      data: {
         name: 'Test User',
         email: 'test@example.com',
         passwordHash: 'hashed-password',
+        isActive: false,
       },
-    ]);
-    expect(request.session.auth).toEqual({
-      userId: 'user-1',
-      role: UserRole.USER,
+      select: {
+        id: true,
+        email: true,
+        name: true,
+      },
     });
-    expect(result.email).toBe('test@example.com');
+    expect(prismaService.emailLoginChallenge.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({
+          purpose: EmailChallengePurpose.REGISTER,
+        }),
+      }),
+    );
+    expect(mailService.sendRegistrationCode).toHaveBeenCalled();
+    expect(result).toEqual({ success: true });
   });
 
   it('rejects login for inactive users', async () => {
@@ -138,42 +174,83 @@ describe('AuthService', () => {
   });
 
   it('rejects duplicate registration', async () => {
-    const request = createRequest();
-
     usersService.findByEmail.mockResolvedValue(createStoredUser());
 
     await expect(
-      authService.register(
-        {
-          name: 'Test User',
-          email: 'test@example.com',
-          password: 'password123',
-        },
-        request,
-      ),
+      authService.register({
+        name: 'Test User',
+        email: 'test@example.com',
+        password: 'password123',
+      }),
     ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('verifies register code, activates user and creates session', async () => {
+    const request = createRequest();
+
+    usersService.findByEmail.mockResolvedValue(createStoredUser({ isActive: false }));
+    prismaService.emailLoginChallenge.findUnique.mockResolvedValue({
+      email: 'test@example.com',
+      purpose: EmailChallengePurpose.REGISTER,
+      codeHash: 'stored-code-hash',
+      expiresAt: new Date(Date.now() + 60_000),
+      consumedAt: null,
+    });
+    passwordService.compare.mockResolvedValue(true);
+    prismaService.user.update.mockResolvedValue(createPublicUser());
+
+    const result = await authService.verifyRegister(
+      {
+        email: 'test@example.com',
+        code: '123456',
+      },
+      request,
+    );
+
+    expect(prismaService.emailLoginChallenge.delete).toHaveBeenCalledWith({
+      where: {
+        email_purpose: {
+          email: 'test@example.com',
+          purpose: EmailChallengePurpose.REGISTER,
+        },
+      },
+    });
+    expect(request.session.auth).toEqual({
+      userId: 'user-1',
+      role: UserRole.USER,
+    });
+    expect(result.email).toBe('test@example.com');
   });
 
   it('creates a recovery challenge for an existing user', async () => {
     usersService.findByEmail.mockResolvedValue(createStoredUser());
     passwordService.hash.mockResolvedValue('challenge-hash');
+    prismaService.emailLoginChallenge.findUnique.mockResolvedValue(null);
 
     const result = await authService.requestPasswordRecovery({
       email: 'test@example.com',
     });
 
-    expect(prismaService.emailLoginChallenge.deleteMany).toHaveBeenCalledWith({
-      where: { email: 'test@example.com' },
-    });
-    expect(prismaService.emailLoginChallenge.create).toHaveBeenCalled();
+    expect(prismaService.emailLoginChallenge.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({
+          purpose: EmailChallengePurpose.PASSWORD_RECOVERY,
+        }),
+      }),
+    );
+    expect(mailService.sendPasswordRecoveryCode).toHaveBeenCalled();
     expect(result).toEqual({ success: true });
   });
 
-  it('accepts any non-empty recovery code when challenge exists', async () => {
-    prismaService.emailLoginChallenge.findFirst.mockResolvedValue({
-      id: 'challenge-1',
+  it('verifies recovery code only when it matches stored hash', async () => {
+    prismaService.emailLoginChallenge.findUnique.mockResolvedValue({
+      email: 'test@example.com',
+      purpose: EmailChallengePurpose.PASSWORD_RECOVERY,
+      codeHash: 'stored-code-hash',
+      expiresAt: new Date(Date.now() + 60_000),
       consumedAt: null,
     });
+    passwordService.compare.mockResolvedValue(true);
 
     const result = await authService.verifyPasswordRecovery({
       email: 'test@example.com',
@@ -181,7 +258,12 @@ describe('AuthService', () => {
     });
 
     expect(prismaService.emailLoginChallenge.update).toHaveBeenCalledWith({
-      where: { id: 'challenge-1' },
+      where: {
+        email_purpose: {
+          email: 'test@example.com',
+          purpose: EmailChallengePurpose.PASSWORD_RECOVERY,
+        },
+      },
       data: {
         consumedAt: expect.any(Date),
       },
@@ -191,8 +273,11 @@ describe('AuthService', () => {
 
   it('rejects reset when recovery code was not verified', async () => {
     usersService.findByEmail.mockResolvedValue(createStoredUser());
-    prismaService.emailLoginChallenge.findFirst.mockResolvedValue({
-      id: 'challenge-1',
+    prismaService.emailLoginChallenge.findUnique.mockResolvedValue({
+      email: 'test@example.com',
+      purpose: EmailChallengePurpose.PASSWORD_RECOVERY,
+      codeHash: 'stored-code-hash',
+      expiresAt: new Date(Date.now() + 60_000),
       consumedAt: null,
     });
 
@@ -207,11 +292,15 @@ describe('AuthService', () => {
 
   it('updates password and removes challenges after verified recovery', async () => {
     usersService.findByEmail.mockResolvedValue(createStoredUser());
-    prismaService.emailLoginChallenge.findFirst.mockResolvedValue({
-      id: 'challenge-1',
+    prismaService.emailLoginChallenge.findUnique.mockResolvedValue({
+      email: 'test@example.com',
+      purpose: EmailChallengePurpose.PASSWORD_RECOVERY,
+      codeHash: 'stored-code-hash',
+      expiresAt: new Date(Date.now() + 60_000),
       consumedAt: new Date(),
       userId: 'user-1',
     });
+    passwordService.compare.mockResolvedValue(true);
     passwordService.hash.mockResolvedValue('hashed-password');
     prismaService.user.update.mockResolvedValue(undefined);
     prismaService.emailLoginChallenge.deleteMany.mockResolvedValue(undefined);
@@ -239,6 +328,24 @@ describe('AuthService', () => {
         password: 'password123',
       }),
     ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('blocks resend when cooldown is active', async () => {
+    usersService.findByEmail.mockResolvedValue(createStoredUser({ isActive: false }));
+    prismaService.emailLoginChallenge.findUnique.mockResolvedValue({
+      email: 'test@example.com',
+      purpose: EmailChallengePurpose.REGISTER,
+      codeHash: 'stored-code-hash',
+      expiresAt: new Date(Date.now() + 60_000),
+      consumedAt: null,
+      lastSentAt: new Date(),
+    });
+
+    await expect(
+      authService.resendRegisterCode({
+        email: 'test@example.com',
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
   });
 });
 

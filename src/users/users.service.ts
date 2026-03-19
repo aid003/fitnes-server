@@ -43,6 +43,7 @@ export class UsersService {
     email: string;
     passwordHash: string;
     role?: UserRole;
+    isActive?: boolean;
   }): Promise<PublicUser> {
     try {
       return await this.prisma.user.create({
@@ -51,6 +52,7 @@ export class UsersService {
           email: input.email,
           passwordHash: input.passwordHash,
           role: input.role ?? UserRole.USER,
+          isActive: input.isActive ?? true,
         },
         select: userPublicSelect,
       });

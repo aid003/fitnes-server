@@ -75,6 +75,11 @@ enum ScheduleWeekday {
   SUNDAY
 }
 
+enum EmailChallengePurpose {
+  REGISTER
+  PASSWORD_RECOVERY
+}
+
 model User {
   id                  String               @id @default(cuid())
   email               String               @unique
@@ -91,16 +96,20 @@ model User {
 }
 
 model EmailLoginChallenge {
-  id         String   @id @default(cuid())
+  id         String                @id @default(cuid())
   email      String
+  purpose    EmailChallengePurpose
   codeHash   String
   expiresAt  DateTime
   consumedAt DateTime?
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  lastSentAt DateTime
+  attempts   Int                   @default(0)
+  createdAt  DateTime              @default(now())
+  updatedAt  DateTime              @updatedAt
   userId     String?
-  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  user       User?                 @relation(fields: [userId], references: [id], onDelete: SetNull)
 
+  @@unique([email, purpose])
   @@index([email, expiresAt])
   @@index([userId])
 }

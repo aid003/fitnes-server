@@ -6,19 +6,25 @@ import {
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
+import { EmailChallengePurpose } from '@prisma/client';
 import type { Request } from 'express';
-import { randomUUID } from 'node:crypto';
+import { randomInt } from 'node:crypto';
 import { PasswordService } from '../common/security/password.service';
 import { setAuthenticatedSession } from '../common/auth/session-auth.util';
+import { MailService } from '../mail/mail.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { UsersService } from '../users/users.service';
 import { RequestPasswordRecoveryDto } from './dto/request-password-recovery.dto';
+import { ResendRegisterCodeDto } from './dto/resend-register-code.dto';
 import { ResetPasswordRecoveryDto } from './dto/reset-password-recovery.dto';
+import { VerifyRegisterDto } from './dto/verify-register.dto';
 import { VerifyPasswordRecoveryDto } from './dto/verify-password-recovery.dto';
 
+const CODE_LENGTH = 6;
 const RECOVERY_CHALLENGE_TTL_MS = 15 * 60 * 1000;
+const RESEND_COOLDOWN_MS = 60 * 1000;
 
 @Injectable()
 export class AuthService {
@@ -26,28 +32,143 @@ export class AuthService {
     private readonly usersService: UsersService,
     private readonly passwordService: PasswordService,
     private readonly prisma: PrismaService,
+    private readonly mailService: MailService,
   ) {}
 
-  async register(dto: RegisterDto, request: Request) {
+  async register(dto: RegisterDto): Promise<{ success: true }> {
     const existingUser = await this.usersService.findByEmail(dto.email);
 
+    if (existingUser?.isActive) {
+      throw new ConflictException('Пользователь с такой почтой уже существует');
+    }
+
     if (existingUser) {
-      throw new ConflictException('User already exists');
+      const existingChallenge = await this.prisma.emailLoginChallenge.findUnique({
+        where: {
+          email_purpose: {
+            email: dto.email,
+            purpose: EmailChallengePurpose.REGISTER,
+          },
+        },
+      });
+
+      this.assertCooldown(existingChallenge?.lastSentAt);
     }
 
     const passwordHash = await this.passwordService.hash(dto.password);
-    const user = await this.usersService.createUser({
-      name: dto.name.trim(),
+    const name = dto.name.trim();
+    const user = existingUser
+      ? await this.prisma.user.update({
+          where: { id: existingUser.id },
+          data: {
+            name,
+            passwordHash,
+            isActive: false,
+          },
+          select: {
+            id: true,
+            email: true,
+            name: true,
+          },
+        })
+      : await this.prisma.user.create({
+          data: {
+            name,
+            email: dto.email,
+            passwordHash,
+            isActive: false,
+          },
+          select: {
+            id: true,
+            email: true,
+            name: true,
+          },
+        });
+
+    await this.issueChallenge({
+      email: user.email,
+      userId: user.id,
+      purpose: EmailChallengePurpose.REGISTER,
+      recipientName: user.name,
+      skipCooldownCheck: true,
+    });
+
+    return { success: true };
+  }
+
+  async verifyRegister(dto: VerifyRegisterDto, request: Request) {
+    const user = await this.usersService.findByEmail(dto.email);
+
+    if (!user) {
+      throw new NotFoundException('Заявка на регистрацию не найдена');
+    }
+
+    if (user.isActive) {
+      throw new BadRequestException('Почта уже подтверждена');
+    }
+
+    await this.assertValidChallenge({
       email: dto.email,
-      passwordHash,
+      purpose: EmailChallengePurpose.REGISTER,
+      code: dto.code,
+    });
+
+    const updatedUser = await this.prisma.$transaction(async (tx) => {
+      await tx.emailLoginChallenge.delete({
+        where: {
+          email_purpose: {
+            email: dto.email,
+            purpose: EmailChallengePurpose.REGISTER,
+          },
+        },
+      });
+
+      return tx.user.update({
+        where: { id: user.id },
+        data: {
+          isActive: true,
+        },
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          role: true,
+          isActive: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      });
     });
 
     await setAuthenticatedSession(request, {
-      id: user.id,
-      role: user.role,
+      id: updatedUser.id,
+      role: updatedUser.role,
     });
 
-    return user;
+    return updatedUser;
+  }
+
+  async resendRegisterCode(
+    dto: ResendRegisterCodeDto,
+  ): Promise<{ success: true }> {
+    const user = await this.usersService.findByEmail(dto.email);
+
+    if (!user) {
+      throw new NotFoundException('Заявка на регистрацию не найдена');
+    }
+
+    if (user.isActive) {
+      throw new BadRequestException('Почта уже подтверждена');
+    }
+
+    await this.issueChallenge({
+      email: user.email,
+      userId: user.id,
+      purpose: EmailChallengePurpose.REGISTER,
+      recipientName: user.name,
+    });
+
+    return { success: true };
   }
 
   async login(dto: LoginDto, request: Request) {
@@ -104,64 +225,46 @@ export class AuthService {
   ): Promise<{ success: true }> {
     const user = await this.usersService.findByEmail(dto.email);
 
-    if (!user) {
+    if (!user || !user.isActive) {
       return { success: true };
     }
 
-    const expiresAt = new Date(Date.now() + RECOVERY_CHALLENGE_TTL_MS);
-    const codeHash = await this.passwordService.hash(randomUUID());
-
-    await this.prisma.emailLoginChallenge.deleteMany({
-      where: {
-        email: dto.email,
-      },
-    });
-
-    await this.prisma.emailLoginChallenge.create({
-      data: {
-        email: dto.email,
-        codeHash,
-        expiresAt,
-        userId: user.id,
-      },
+    await this.issueChallenge({
+      email: dto.email,
+      userId: user.id,
+      purpose: EmailChallengePurpose.PASSWORD_RECOVERY,
+      recipientName: user.name,
     });
 
     return { success: true };
   }
 
+  async resendPasswordRecovery(
+    dto: RequestPasswordRecoveryDto,
+  ): Promise<{ success: true }> {
+    return this.requestPasswordRecovery(dto);
+  }
+
   async verifyPasswordRecovery(
     dto: VerifyPasswordRecoveryDto,
   ): Promise<{ success: true }> {
-    const code = dto.code.trim();
-
-    if (!code) {
-      throw new BadRequestException('Recovery code is required');
-    }
-
-    const challenge = await this.prisma.emailLoginChallenge.findFirst({
-      where: {
-        email: dto.email,
-        expiresAt: {
-          gt: new Date(),
-        },
-      },
-      orderBy: {
-        createdAt: 'desc',
-      },
+    await this.assertValidChallenge({
+      email: dto.email,
+      purpose: EmailChallengePurpose.PASSWORD_RECOVERY,
+      code: dto.code,
     });
 
-    if (!challenge) {
-      return { success: true };
-    }
-
-    if (!challenge.consumedAt) {
-      await this.prisma.emailLoginChallenge.update({
-        where: { id: challenge.id },
-        data: {
-          consumedAt: new Date(),
+    await this.prisma.emailLoginChallenge.update({
+      where: {
+        email_purpose: {
+          email: dto.email,
+          purpose: EmailChallengePurpose.PASSWORD_RECOVERY,
         },
-      });
-    }
+      },
+      data: {
+        consumedAt: new Date(),
+      },
+    });
 
     return { success: true };
   }
@@ -172,30 +275,56 @@ export class AuthService {
     const code = dto.code.trim();
 
     if (!code) {
-      throw new BadRequestException('Recovery code is required');
+      throw new BadRequestException('Код восстановления обязателен');
     }
 
     const user = await this.usersService.findByEmail(dto.email);
 
     if (!user) {
-      throw new NotFoundException('User not found');
+      throw new NotFoundException('Пользователь не найден');
     }
 
-    const challenge = await this.prisma.emailLoginChallenge.findFirst({
+    const challenge = await this.prisma.emailLoginChallenge.findUnique({
       where: {
-        email: dto.email,
-        userId: user.id,
-        expiresAt: {
-          gt: new Date(),
+        email_purpose: {
+          email: dto.email,
+          purpose: EmailChallengePurpose.PASSWORD_RECOVERY,
         },
-      },
-      orderBy: {
-        createdAt: 'desc',
       },
     });
 
-    if (!challenge || !challenge.consumedAt) {
-      throw new BadRequestException('Recovery code is not verified');
+    if (!challenge) {
+      throw new BadRequestException('Код не найден. Запросите новый код');
+    }
+
+    if (challenge.expiresAt.getTime() <= Date.now()) {
+      throw new BadRequestException(
+        'Срок действия кода истек. Запросите новый код',
+      );
+    }
+
+    if (!challenge.consumedAt) {
+      throw new BadRequestException('Сначала подтвердите код из письма');
+    }
+
+    const isCodeValid = await this.passwordService.compare(code, challenge.codeHash);
+
+    if (!isCodeValid) {
+      await this.prisma.emailLoginChallenge.update({
+        where: {
+          email_purpose: {
+            email: dto.email,
+            purpose: EmailChallengePurpose.PASSWORD_RECOVERY,
+          },
+        },
+        data: {
+          attempts: {
+            increment: 1,
+          },
+        },
+      });
+
+      throw new BadRequestException('Неверный код');
     }
 
     const passwordHash = await this.passwordService.hash(dto.password);
@@ -210,10 +339,155 @@ export class AuthService {
       this.prisma.emailLoginChallenge.deleteMany({
         where: {
           email: dto.email,
+          purpose: EmailChallengePurpose.PASSWORD_RECOVERY,
         },
       }),
     ]);
 
     return { success: true };
   }
+
+  private async issueChallenge(input: {
+    email: string;
+    userId: string;
+    purpose: EmailChallengePurpose;
+    recipientName?: string;
+    skipCooldownCheck?: boolean;
+  }) {
+    const existingChallenge = await this.prisma.emailLoginChallenge.findUnique({
+      where: {
+        email_purpose: {
+          email: input.email,
+          purpose: input.purpose,
+        },
+      },
+    });
+
+    if (!input.skipCooldownCheck) {
+      this.assertCooldown(existingChallenge?.lastSentAt);
+    }
+
+    const code = generateNumericCode();
+    const codeHash = await this.passwordService.hash(code);
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + RECOVERY_CHALLENGE_TTL_MS);
+
+    await this.prisma.emailLoginChallenge.upsert({
+      where: {
+        email_purpose: {
+          email: input.email,
+          purpose: input.purpose,
+        },
+      },
+      create: {
+        email: input.email,
+        purpose: input.purpose,
+        userId: input.userId,
+        codeHash,
+        expiresAt,
+        lastSentAt: now,
+        attempts: 0,
+      },
+      update: {
+        userId: input.userId,
+        codeHash,
+        expiresAt,
+        consumedAt: null,
+        lastSentAt: now,
+        attempts: 0,
+      },
+    });
+
+    if (input.purpose === EmailChallengePurpose.REGISTER) {
+      await this.mailService.sendRegistrationCode({
+        to: input.email,
+        recipientName: input.recipientName,
+        code,
+        expiresAt,
+      });
+      return;
+    }
+
+    await this.mailService.sendPasswordRecoveryCode({
+      to: input.email,
+      recipientName: input.recipientName,
+      code,
+      expiresAt,
+    });
+  }
+
+  private async assertValidChallenge(input: {
+    email: string;
+    purpose: EmailChallengePurpose;
+    code: string;
+  }) {
+    const challenge = await this.prisma.emailLoginChallenge.findUnique({
+      where: {
+        email_purpose: {
+          email: input.email,
+          purpose: input.purpose,
+        },
+      },
+    });
+
+    if (!challenge) {
+      throw new BadRequestException('Код не найден. Запросите новый код');
+    }
+
+    if (challenge.expiresAt.getTime() <= Date.now()) {
+      throw new BadRequestException(
+        'Срок действия кода истек. Запросите новый код',
+      );
+    }
+
+    if (challenge.consumedAt) {
+      throw new BadRequestException('Код уже был использован');
+    }
+
+    const isCodeValid = await this.passwordService.compare(
+      input.code.trim(),
+      challenge.codeHash,
+    );
+
+    if (!isCodeValid) {
+      await this.prisma.emailLoginChallenge.update({
+        where: {
+          email_purpose: {
+            email: input.email,
+            purpose: input.purpose,
+          },
+        },
+        data: {
+          attempts: {
+            increment: 1,
+          },
+        },
+      });
+
+      throw new BadRequestException('Неверный код');
+    }
+
+    return challenge;
+  }
+
+  private assertCooldown(lastSentAt?: Date) {
+    if (!lastSentAt) {
+      return;
+    }
+
+    const availableAt = lastSentAt.getTime() + RESEND_COOLDOWN_MS;
+
+    if (availableAt > Date.now()) {
+      throw new BadRequestException(
+        'Повторная отправка будет доступна через 60 секунд',
+      );
+    }
+  }
+}
+
+function generateNumericCode() {
+  const min = 10 ** (CODE_LENGTH - 1);
+  const max = 10 ** CODE_LENGTH;
+
+  return String(randomInt(min, max));
 }

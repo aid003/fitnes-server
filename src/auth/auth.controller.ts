@@ -17,7 +17,9 @@ import { AuthService } from './auth.service';
 import { LoginDto } from './dto/login.dto';
 import { RequestPasswordRecoveryDto } from './dto/request-password-recovery.dto';
 import { RegisterDto } from './dto/register.dto';
+import { ResendRegisterCodeDto } from './dto/resend-register-code.dto';
 import { ResetPasswordRecoveryDto } from './dto/reset-password-recovery.dto';
+import { VerifyRegisterDto } from './dto/verify-register.dto';
 import { VerifyPasswordRecoveryDto } from './dto/verify-password-recovery.dto';
 
 @Controller('auth')
@@ -25,8 +27,21 @@ export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
   @Post('register')
-  register(@Body() dto: RegisterDto, @Req() request: Request) {
-    return this.authService.register(dto, request);
+  @HttpCode(HttpStatus.OK)
+  register(@Body() dto: RegisterDto) {
+    return this.authService.register(dto);
+  }
+
+  @Post('register/verify')
+  @HttpCode(HttpStatus.OK)
+  verifyRegister(@Body() dto: VerifyRegisterDto, @Req() request: Request) {
+    return this.authService.verifyRegister(dto, request);
+  }
+
+  @Post('register/resend')
+  @HttpCode(HttpStatus.OK)
+  resendRegisterCode(@Body() dto: ResendRegisterCodeDto) {
+    return this.authService.resendRegisterCode(dto);
   }
 
   @Post('login')
@@ -39,6 +54,12 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   requestPasswordRecovery(@Body() dto: RequestPasswordRecoveryDto) {
     return this.authService.requestPasswordRecovery(dto);
+  }
+
+  @Post('recovery/resend')
+  @HttpCode(HttpStatus.OK)
+  resendPasswordRecovery(@Body() dto: RequestPasswordRecoveryDto) {
+    return this.authService.resendPasswordRecovery(dto);
   }
 
   @Post('recovery/verify')
