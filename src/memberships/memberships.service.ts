@@ -55,6 +55,21 @@ const membershipSelect = {
       title: true,
       subtitle: true,
       description: true,
+      group: {
+        select: {
+          title: true,
+          variant: {
+            select: {
+              title: true,
+              category: {
+                select: {
+                  title: true,
+                },
+              },
+            },
+          },
+        },
+      },
       features: {
         select: {
           id: true,
@@ -220,6 +235,11 @@ export class MembershipsService {
       payloadSummary: {
         customerName: payload.user.name,
         customerEmail: payload.user.email,
+        planOrigin: formatPlanOriginParts(
+          payload.plan.categoryTitle ?? null,
+          payload.plan.variantTitle ?? null,
+          payload.plan.groupTitle ?? null,
+        ),
         planTitle: payload.plan.title,
         planSubtitle: payload.plan.subtitle,
         amount: payload.payment.amount,
@@ -799,6 +819,7 @@ export class MembershipsService {
       subtitle:
         membership.subtitle ??
         formatMembershipPeriod(membership.startsAt, membership.endsAt),
+      planOrigin: formatPlanOriginFromMembership(membership),
       startsAt: membership.startsAt.toISOString(),
       status: membership.status,
       statusLabel: status.label,
@@ -833,6 +854,7 @@ export class MembershipsService {
       id: membership.id,
       title: membership.title,
       subtitle: formatMembershipPeriod(membership.startsAt, membership.endsAt),
+      planOrigin: formatPlanOriginFromMembership(membership),
       startsAt: membership.startsAt.toISOString(),
       status: membership.status,
       statusLabel: status.label,
@@ -903,6 +925,24 @@ export class MembershipsService {
       throw new NotFoundException('Membership not found');
     }
   }
+}
+
+function formatPlanOriginFromMembership(membership: MembershipRecord) {
+  return formatPlanOriginParts(
+    membership.passPlan.group.variant.category.title,
+    membership.passPlan.group.variant.title,
+    membership.passPlan.group.title,
+  );
+}
+
+function formatPlanOriginParts(
+  categoryTitle: string | null,
+  variantTitle: string | null,
+  groupTitle: string | null,
+) {
+  const parts = [categoryTitle, variantTitle, groupTitle].filter(Boolean);
+
+  return parts.length > 0 ? parts.join(' / ') : null;
 }
 
 function buildMembershipHistory(membership: MembershipRecord) {
