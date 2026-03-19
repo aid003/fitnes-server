@@ -31,6 +31,14 @@
 $ npm install
 ```
 
+## Required environment
+
+Set `MEMBERSHIP_QR_SECRET` for signing membership QR payloads. Use a long random value in production, for example:
+
+```bash
+openssl rand -hex 32
+```
+
 ## Compile and run the project
 
 ```bash

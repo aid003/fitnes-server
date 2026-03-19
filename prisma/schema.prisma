@@ -161,6 +161,7 @@ model PassPlan {
   slug            String
   description     String?
   subtitle        String?
+  /// Canonical plan price in kopecks.
   price           Int
   currency        String          @default("RUB")
   durationValue   Int?
@@ -248,6 +249,7 @@ model PaymentOrder {
   membershipId          String?
   merchantOrderNumber   String             @unique
   gatewayOrderId        String?            @unique
+  /// Canonical payment amount in kopecks.
   amount                Int
   currency              String             @default("RUB")
   status                PaymentOrderStatus @default(CREATED)

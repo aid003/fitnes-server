@@ -70,6 +70,9 @@ describe('PassesService', () => {
     const [firstCall] = prismaService.passCategory.create.mock.calls;
     expect(firstCall[0].data.slug).toBe('unlimited-daily');
     expect(firstCall[0].data.variants.create[0].groups.create).toHaveLength(5);
+    expect(
+      firstCall[0].data.variants.create[0].groups.create[0].plans.create[0].price,
+    ).toBe(849000);
 
     const createdCategorySlugs =
       prismaService.passCategory.create.mock.calls.map(
@@ -140,7 +143,7 @@ describe('PassesService', () => {
                   slug: '1-month',
                   description: null,
                   subtitle: null,
-                  price: 6490,
+                  price: 649000,
                   currency: 'RUB',
                   durationValue: 1,
                   durationUnit: 'MONTH',
@@ -168,8 +171,44 @@ describe('PassesService', () => {
     const result = await passesService.getPublicCategoryBySlug('unlimited');
 
     expect(result.slug).toBe('unlimited');
+    expect(result.variants[0]?.groups[0]?.plans[0]?.price).toBe(6490);
     expect(result.variants[0]?.groups[0]?.plans[0]?.badges[0]?.label).toBe(
       '+2 дня',
+    );
+  });
+
+  it('stores admin-entered plan prices in kopecks', async () => {
+    prismaService.passPlanGroup.findUnique.mockResolvedValue({
+      id: 'group-1',
+      variant: {
+        categoryId: 'category-1',
+      },
+    });
+    prismaService.passPlan.create.mockResolvedValue({});
+    prismaService.passCategory.findUnique.mockResolvedValue({
+      id: 'category-1',
+      title: 'Unlimited',
+      slug: 'unlimited',
+      description: null,
+      coverImageUrl: '/buy/image1.jpg',
+      sortOrder: 0,
+      isActive: true,
+      variants: [],
+    });
+
+    await passesService.createPlan('group-1', {
+      title: '1 month',
+      slug: '1-month',
+      price: 8490,
+      currency: 'RUB',
+    });
+
+    expect(prismaService.passPlan.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          price: 849000,
+        }),
+      }),
     );
   });
 

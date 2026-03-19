@@ -5,6 +5,10 @@ import {
   PassFeatureIcon,
   Prisma,
 } from '@prisma/client';
+import {
+  kopecksToRubles,
+  rublesToKopecks,
+} from '../common/money/money';
 import { handlePrismaError } from '../common/database/prisma-errors';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreatePassBadgeDto } from './dto/create-pass-badge.dto';
@@ -170,14 +174,16 @@ export class PassesService implements OnModuleInit {
       throw new NotFoundException('Pass category not found');
     }
 
-    return category;
+    return mapCategoryPricesToRubles(category);
   }
 
   async listAdminCategories(): Promise<PassCategoryDetails[]> {
-    return this.prisma.passCategory.findMany({
+    const categories = await this.prisma.passCategory.findMany({
       select: passCategorySelect,
       orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
     });
+
+    return categories.map(mapCategoryPricesToRubles);
   }
 
   async createCategory(
@@ -336,7 +342,7 @@ export class PassesService implements OnModuleInit {
           slug: dto.slug.trim(),
           description: dto.description?.trim(),
           subtitle: dto.subtitle?.trim(),
-          price: dto.price,
+          price: rublesToKopecks(dto.price),
           currency: dto.currency?.trim() ?? 'RUB',
           durationValue: dto.durationValue,
           durationUnit: dto.durationUnit,
@@ -361,9 +367,17 @@ export class PassesService implements OnModuleInit {
     const plan = await this.ensurePlanExists(planId);
 
     try {
+      const normalized = normalizeOptionalValues(dto);
+
       await this.prisma.passPlan.update({
         where: { id: planId },
-        data: normalizeOptionalValues(dto),
+        data: {
+          ...normalized,
+          price:
+            normalized.price === undefined
+              ? undefined
+              : rublesToKopecks(normalized.price),
+        },
       });
     } catch (error) {
       handlePrismaError(error, 'Pass plan');
@@ -469,7 +483,7 @@ export class PassesService implements OnModuleInit {
       throw new NotFoundException('Pass category not found');
     }
 
-    return category;
+    return mapCategoryPricesToRubles(category);
   }
 
   private async ensureCategoryExists(categoryId: string) {
@@ -1750,7 +1764,7 @@ function createPlan(input: {
     slug: input.slug,
     description: input.description,
     subtitle: input.subtitle,
-    price: input.price,
+    price: rublesToKopecks(input.price),
     currency: 'RUB',
     durationValue: input.durationValue,
     durationUnit: input.durationUnit,
@@ -2008,4 +2022,20 @@ function formatMonthLabel(months: number): string {
   }
 
   return 'месяцев';
+}
+
+function mapCategoryPricesToRubles(category: PassCategoryDetails): PassCategoryDetails {
+  return {
+    ...category,
+    variants: category.variants.map((variant) => ({
+      ...variant,
+      groups: variant.groups.map((group) => ({
+        ...group,
+        plans: group.plans.map((plan) => ({
+          ...plan,
+          price: kopecksToRubles(plan.price),
+        })),
+      })),
+    })),
+  };
 }

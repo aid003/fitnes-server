@@ -2,11 +2,16 @@ import {
   BadGatewayException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PaymentOrderStatus, Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
+import {
+  kopecksToRubles,
+  toGatewayAmount,
+} from '../common/money/money';
 import { MembershipsService } from '../memberships/memberships.service';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -72,6 +77,8 @@ type AlfaStatusResponse = {
 
 @Injectable()
 export class PaymentsService {
+  private readonly logger = new Logger(PaymentsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
@@ -267,21 +274,41 @@ export class PaymentsService {
         select: paymentSelect,
       });
 
-      await this.membershipsService.attachQrSnapshotFromPayment(
-        membership.id,
-        finalPayment.id,
-      );
+      await this.attachQrSnapshotSafely(membership.id, finalPayment.id);
     } else if (
       synced.status === PaymentOrderStatus.PAID &&
       synced.membershipId
     ) {
-      await this.membershipsService.attachQrSnapshotFromPayment(
-        synced.membershipId,
-        synced.id,
-      );
+      await this.attachQrSnapshotSafely(synced.membershipId, synced.id);
     }
 
     return this.mapPaymentStatus(finalPayment);
+  }
+
+  private async attachQrSnapshotSafely(
+    membershipId: string,
+    paymentId: string,
+  ) {
+    try {
+      await this.membershipsService.attachQrSnapshotFromPayment(
+        membershipId,
+        paymentId,
+      );
+    } catch (error) {
+      const details =
+        error instanceof Error
+          ? { message: error.message, stack: error.stack }
+          : { error };
+
+      this.logger.error(
+        {
+          paymentId,
+          membershipId,
+          ...details,
+        },
+        'Failed to attach membership QR snapshot after successful payment',
+      );
+    }
   }
 
   private async getPaymentForUser(userId: string, paymentId: string) {
@@ -304,7 +331,7 @@ export class PaymentsService {
   private async registerOrder(payment: PaymentRecord) {
     return this.callAlfa<AlfaRegisterResponse>('register.do', {
       orderNumber: payment.merchantOrderNumber,
-      amount: String(payment.amount),
+      amount: toGatewayAmount(payment.amount, payment.currency),
       currency: ALFA_CURRENCY_CODE,
       returnUrl: payment.returnUrl,
       failUrl: payment.failUrl,
@@ -407,7 +434,7 @@ export class PaymentsService {
       statusLabel: statusMeta.label,
       statusTone: statusMeta.tone,
       message: statusMeta.message,
-      amount: payment.amount,
+      amount: kopecksToRubles(payment.amount),
       currency: payment.currency,
       planTitle: payment.planTitle,
       planSubtitle: payment.planSubtitle,
@@ -465,7 +492,8 @@ function resolvePaymentState(
   const errorCode = normalizeNumeric(statusResponse.errorCode);
   const orderStatus =
     statusResponse.orderStatus ?? payment.gatewayOrderStatus ?? null;
-  const paymentState = statusResponse.paymentAmountInfo?.paymentState ?? null;
+  const paymentAmounts = normalizeGatewayAmounts(statusResponse.paymentAmountInfo);
+  const paymentState = paymentAmounts.paymentState;
   const actionCode = normalizeNullableNumber(statusResponse.actionCode);
   const actionCodeDescription =
     statusResponse.actionCodeDescription ??
@@ -473,7 +501,13 @@ function resolvePaymentState(
     payment.actionCodeDescription ??
     null;
 
-  if (errorCode === 0 && (orderStatus === 2 || paymentState === 'DEPOSITED')) {
+  if (
+    errorCode === 0 &&
+    (orderStatus === 2 ||
+      paymentState === 'DEPOSITED' ||
+      (paymentAmounts.depositedAmountKopecks !== null &&
+        paymentAmounts.depositedAmountKopecks >= payment.amount))
+  ) {
     return {
       status: PaymentOrderStatus.PAID,
       gatewayOrderStatus: orderStatus,
@@ -533,6 +567,23 @@ function resolvePaymentState(
     actionCodeDescription,
     paidAt: payment.paidAt,
     failedAt: payment.failedAt,
+  };
+}
+
+function normalizeGatewayAmounts(
+  paymentAmountInfo: AlfaStatusResponse['paymentAmountInfo'] | undefined,
+) {
+  return {
+    paymentState: paymentAmountInfo?.paymentState ?? null,
+    approvedAmountKopecks: normalizeNullableNumber(
+      paymentAmountInfo?.approvedAmount,
+    ),
+    depositedAmountKopecks: normalizeNullableNumber(
+      paymentAmountInfo?.depositedAmount,
+    ),
+    refundedAmountKopecks: normalizeNullableNumber(
+      paymentAmountInfo?.refundedAmount,
+    ),
   };
 }
 

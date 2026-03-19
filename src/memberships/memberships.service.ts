@@ -21,6 +21,7 @@ import {
   MembershipQrService,
 } from './membership-qr.service';
 import { UpdateMembershipDto } from './dto/update-membership.dto';
+import { kopecksToRubles } from '../common/money/money';
 
 const DAY_IN_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_FREEZE_DAYS = 7;
@@ -331,7 +332,7 @@ export class MembershipsService {
         merchantOrderNumber: paymentOrder.merchantOrderNumber,
         gatewayOrderId: paymentOrder.gatewayOrderId,
         status: paymentOrder.status,
-        amount: paymentOrder.amount,
+        amount: kopecksToRubles(paymentOrder.amount),
         currency: paymentOrder.currency,
         createdAt: paymentOrder.createdAt.toISOString(),
         paidAt: paymentOrder.paidAt?.toISOString() ?? null,
