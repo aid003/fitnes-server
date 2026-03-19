@@ -268,6 +268,21 @@ export class MembershipsService {
             billingType: true,
             durationValue: true,
             durationUnit: true,
+            group: {
+              select: {
+                title: true,
+                variant: {
+                  select: {
+                    title: true,
+                    category: {
+                      select: {
+                        title: true,
+                      },
+                    },
+                  },
+                },
+              },
+            },
           },
         },
       },
@@ -323,6 +338,9 @@ export class MembershipsService {
         subtitle: paymentOrder.passPlan.subtitle ?? paymentOrder.planSubtitle,
         description:
           paymentOrder.passPlan.description ?? paymentOrder.planDescription,
+        categoryTitle: paymentOrder.passPlan.group.variant.category.title,
+        variantTitle: paymentOrder.passPlan.group.variant.title,
+        groupTitle: paymentOrder.passPlan.group.title,
         billingType: paymentOrder.passPlan.billingType,
         durationValue: paymentOrder.passPlan.durationValue,
         durationUnit: paymentOrder.passPlan.durationUnit,

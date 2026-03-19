@@ -47,6 +47,25 @@ const paymentSelect = {
   paidAt: true,
   failedAt: true,
   membershipIssuedAt: true,
+  passPlan: {
+    select: {
+      group: {
+        select: {
+          title: true,
+          variant: {
+            select: {
+              title: true,
+              category: {
+                select: {
+                  title: true,
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
 } satisfies Prisma.PaymentOrderSelect;
 
 type PaymentRecord = Prisma.PaymentOrderGetPayload<{
@@ -119,6 +138,21 @@ export class PaymentsService {
         description: true,
         price: true,
         currency: true,
+        group: {
+          select: {
+            title: true,
+            variant: {
+              select: {
+                title: true,
+                category: {
+                  select: {
+                    title: true,
+                  },
+                },
+              },
+            },
+          },
+        },
       },
     });
 
@@ -438,6 +472,9 @@ export class PaymentsService {
       currency: payment.currency,
       planTitle: payment.planTitle,
       planSubtitle: payment.planSubtitle,
+      planCategoryTitle: payment.passPlan?.group.variant.category.title ?? null,
+      planVariantTitle: payment.passPlan?.group.variant.title ?? null,
+      planGroupTitle: payment.passPlan?.group.title ?? null,
       createdAt: payment.createdAt.toISOString(),
       updatedAt: payment.updatedAt.toISOString(),
       paidAt: payment.paidAt?.toISOString() ?? null,

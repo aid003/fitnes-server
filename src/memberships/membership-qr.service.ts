@@ -29,6 +29,9 @@ export type MembershipQrPayload = {
     title: string;
     subtitle: string | null;
     description: string | null;
+    categoryTitle?: string | null;
+    variantTitle?: string | null;
+    groupTitle?: string | null;
     billingType: string | null;
     durationValue: number | null;
     durationUnit: string | null;
