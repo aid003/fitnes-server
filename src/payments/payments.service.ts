@@ -47,8 +47,18 @@ const paymentSelect = {
   paidAt: true,
   failedAt: true,
   membershipIssuedAt: true,
+  user: {
+    select: {
+      id: true,
+      name: true,
+      email: true,
+    },
+  },
   passPlan: {
     select: {
+      id: true,
+      title: true,
+      subtitle: true,
       group: {
         select: {
           title: true,
@@ -92,6 +102,17 @@ type AlfaStatusResponse = {
     depositedAmount?: number;
     refundedAmount?: number;
   };
+};
+
+type AdminPaymentsRange = {
+  key: '30d';
+  days: number;
+  label: string;
+};
+
+type AdminLedgerCursor = {
+  paidAt: string;
+  id: string;
 };
 
 @Injectable()
@@ -319,6 +340,196 @@ export class PaymentsService {
     return this.mapPaymentStatus(finalPayment);
   }
 
+  async getAdminPaymentsOverview(rangeKey?: string) {
+    const range = resolveAdminPaymentsRange(rangeKey);
+    const boundaries = getAdminPaymentsBoundaries(range.days);
+
+    const [paidPayments, createdOrdersCount, previousCreatedOrdersCount] =
+      await Promise.all([
+      this.prisma.paymentOrder.findMany({
+        where: {
+          status: PaymentOrderStatus.PAID,
+          paidAt: {
+            gte: boundaries.previousStart,
+            lt: boundaries.currentEndExclusive,
+          },
+        },
+        select: paymentSelect,
+      }),
+      this.prisma.paymentOrder.count({
+        where: {
+          createdAt: {
+            gte: boundaries.currentStart,
+            lt: boundaries.currentEndExclusive,
+          },
+        },
+      }),
+      this.prisma.paymentOrder.count({
+        where: {
+          createdAt: {
+            gte: boundaries.previousStart,
+            lt: boundaries.previousEndExclusive,
+          },
+        },
+      }),
+    ]);
+
+    const currentPaid = paidPayments.filter(
+      (payment) =>
+        payment.paidAt &&
+        payment.paidAt >= boundaries.currentStart &&
+        payment.paidAt < boundaries.currentEndExclusive,
+    );
+    const previousPaid = paidPayments.filter(
+      (payment) =>
+        payment.paidAt &&
+        payment.paidAt >= boundaries.previousStart &&
+        payment.paidAt < boundaries.previousEndExclusive,
+    );
+
+    const currentMetrics = summarizePayments(currentPaid, createdOrdersCount);
+    const previousMetrics = summarizePayments(
+      previousPaid,
+      previousCreatedOrdersCount,
+    );
+    const revenueSeries = buildDailySeries(
+      currentPaid,
+      boundaries.currentStart,
+      range.days,
+      'revenue',
+    );
+    const paymentsSeries = buildDailySeries(
+      currentPaid,
+      boundaries.currentStart,
+      range.days,
+      'count',
+    );
+
+    const currentWeekPayments = currentPaid.filter(
+      (payment) =>
+        payment.paidAt &&
+        payment.paidAt >= boundaries.currentWeekStart &&
+        payment.paidAt < boundaries.currentWeekEndExclusive,
+    );
+    const previousWeekPayments = paidPayments.filter(
+      (payment) =>
+        payment.paidAt &&
+        payment.paidAt >= boundaries.previousWeekStart &&
+        payment.paidAt < boundaries.previousWeekEndExclusive,
+    );
+
+    return {
+      range: range.key,
+      rangeLabel: range.label,
+      generatedAt: new Date().toISOString(),
+      totals: currentMetrics,
+      comparisons: {
+        grossRevenue: buildComparison(
+          currentMetrics.grossRevenue,
+          previousMetrics.grossRevenue,
+        ),
+        successfulPaymentsCount: buildComparison(
+          currentMetrics.successfulPaymentsCount,
+          previousMetrics.successfulPaymentsCount,
+        ),
+        averageCheck: buildComparison(
+          currentMetrics.averageCheck,
+          previousMetrics.averageCheck,
+        ),
+        paidConversionRate: buildComparison(
+          currentMetrics.paidConversionRate,
+          previousMetrics.paidConversionRate,
+        ),
+      },
+      revenueSeries,
+      paymentsSeries,
+      weeklyComparison: {
+        currentWeek: summarizeWeek(currentWeekPayments),
+        previousWeek: summarizeWeek(previousWeekPayments),
+      },
+      topPlans: {
+        byRevenue: buildTopPlans(currentPaid, 'revenue'),
+        byCount: buildTopPlans(currentPaid, 'count'),
+      },
+    };
+  }
+
+  async getAdminPaymentsLedger(input: {
+    range?: string;
+    cursor?: string;
+    limit?: number;
+  }) {
+    const range = resolveAdminPaymentsRange(input.range);
+    const boundaries = getAdminPaymentsBoundaries(range.days);
+    const limit = normalizeLedgerLimit(input.limit);
+    const cursor = decodeLedgerCursor(input.cursor);
+    const cursorWhere = cursor
+      ? {
+          OR: [
+            {
+              paidAt: {
+                lt: new Date(cursor.paidAt),
+              },
+            },
+            {
+              paidAt: new Date(cursor.paidAt),
+              id: {
+                lt: cursor.id,
+              },
+            },
+          ],
+        }
+      : {};
+
+    const records = await this.prisma.paymentOrder.findMany({
+      where: {
+        status: PaymentOrderStatus.PAID,
+        paidAt: {
+          gte: boundaries.currentStart,
+          lt: boundaries.currentEndExclusive,
+        },
+        ...cursorWhere,
+      },
+      orderBy: [{ paidAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
+      select: paymentSelect,
+    });
+
+    const items = records.slice(0, limit).map((payment) => ({
+      paymentId: payment.id,
+      merchantOrderNumber: payment.merchantOrderNumber,
+      paidAt: payment.paidAt?.toISOString() ?? payment.createdAt.toISOString(),
+      amount: kopecksToRubles(payment.amount),
+      currency: payment.currency,
+      status: payment.status,
+      user: payment.user,
+      plan: {
+        id: payment.passPlan?.id ?? payment.passPlanId,
+        title: payment.planTitle,
+        subtitle: payment.planSubtitle,
+        categoryTitle: payment.passPlan?.group.variant.category.title ?? null,
+        variantTitle: payment.passPlan?.group.variant.title ?? null,
+        groupTitle: payment.passPlan?.group.title ?? null,
+      },
+      membershipId: payment.membershipId,
+      membershipIssuedAt: payment.membershipIssuedAt?.toISOString() ?? null,
+    }));
+
+    const lastItem = items.at(-1);
+
+    return {
+      range: range.key,
+      items,
+      nextCursor:
+        records.length > limit && lastItem
+          ? encodeLedgerCursor({
+              paidAt: lastItem.paidAt,
+              id: lastItem.paymentId,
+            })
+          : null,
+    };
+  }
+
   private async attachQrSnapshotSafely(
     membershipId: string,
     paymentId: string,
@@ -494,6 +705,233 @@ export class PaymentsService {
         payment.status === PaymentOrderStatus.CANCELLED,
     };
   }
+}
+
+function resolveAdminPaymentsRange(rangeKey?: string): AdminPaymentsRange {
+  if (rangeKey && rangeKey !== '30d') {
+    throw new NotFoundException('Payment analytics range is not supported');
+  }
+
+  return {
+    key: '30d',
+    days: 30,
+    label: 'Последние 30 дней',
+  };
+}
+
+function getAdminPaymentsBoundaries(days: number) {
+  const todayStart = startOfDay(new Date());
+  const currentStart = addDays(todayStart, -(days - 1));
+  const currentEndExclusive = addDays(todayStart, 1);
+  const previousStart = addDays(currentStart, -days);
+  const previousEndExclusive = currentStart;
+  const currentWeekStart = startOfWeek(todayStart);
+  const currentWeekEndExclusive = addDays(currentWeekStart, 7);
+  const previousWeekStart = addDays(currentWeekStart, -7);
+  const previousWeekEndExclusive = currentWeekStart;
+
+  return {
+    currentStart,
+    currentEndExclusive,
+    previousStart,
+    previousEndExclusive,
+    currentWeekStart,
+    currentWeekEndExclusive,
+    previousWeekStart,
+    previousWeekEndExclusive,
+  };
+}
+
+function startOfDay(value: Date) {
+  return new Date(
+    value.getFullYear(),
+    value.getMonth(),
+    value.getDate(),
+    0,
+    0,
+    0,
+    0,
+  );
+}
+
+function startOfWeek(value: Date) {
+  const day = value.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+
+  return startOfDay(addDays(value, diff));
+}
+
+function addDays(value: Date, days: number) {
+  const next = new Date(value);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function summarizePayments(payments: PaymentRecord[], createdOrdersCount: number) {
+  const grossRevenueKopecks = payments.reduce(
+    (sum, payment) => sum + payment.amount,
+    0,
+  );
+  const successfulPaymentsCount = payments.length;
+  const averageCheckKopecks =
+    successfulPaymentsCount > 0
+      ? Math.round(grossRevenueKopecks / successfulPaymentsCount)
+      : 0;
+
+  return {
+    grossRevenue: kopecksToRubles(grossRevenueKopecks),
+    successfulPaymentsCount,
+    averageCheck: kopecksToRubles(averageCheckKopecks),
+    createdOrdersCount,
+    paidConversionRate:
+      createdOrdersCount > 0
+        ? roundMetric((successfulPaymentsCount / createdOrdersCount) * 100)
+        : 0,
+  };
+}
+
+function buildComparison(current: number, previous: number) {
+  const delta = roundMetric(current - previous);
+  const deltaPercent =
+    previous !== 0 ? roundMetric((delta / previous) * 100) : null;
+
+  return {
+    current: roundMetric(current),
+    previous: roundMetric(previous),
+    delta,
+    deltaPercent,
+  };
+}
+
+function buildDailySeries(
+  payments: PaymentRecord[],
+  start: Date,
+  days: number,
+  mode: 'revenue' | 'count',
+) {
+  const buckets = new Map<string, number>();
+
+  for (let index = 0; index < days; index += 1) {
+    const date = addDays(start, index);
+    buckets.set(toIsoDate(date), 0);
+  }
+
+  for (const payment of payments) {
+    if (!payment.paidAt) {
+      continue;
+    }
+
+    const key = toIsoDate(payment.paidAt);
+    const current = buckets.get(key);
+
+    if (current === undefined) {
+      continue;
+    }
+
+    buckets.set(
+      key,
+      current + (mode === 'revenue' ? kopecksToRubles(payment.amount) : 1),
+    );
+  }
+
+  return Array.from(buckets.entries()).map(([date, value]) => ({
+    date,
+    value: roundMetric(value),
+  }));
+}
+
+function summarizeWeek(payments: PaymentRecord[]) {
+  const grossRevenueKopecks = payments.reduce(
+    (sum, payment) => sum + payment.amount,
+    0,
+  );
+
+  return {
+    grossRevenue: kopecksToRubles(grossRevenueKopecks),
+    successfulPaymentsCount: payments.length,
+  };
+}
+
+function buildTopPlans(
+  payments: PaymentRecord[],
+  mode: 'revenue' | 'count',
+) {
+  const buckets = new Map<
+    string,
+    {
+      planId: string;
+      title: string;
+      subtitle: string | null;
+      categoryTitle: string | null;
+      value: number;
+    }
+  >();
+
+  for (const payment of payments) {
+    const planId = payment.passPlan?.id ?? payment.passPlanId;
+    const existing = buckets.get(planId);
+    const nextValue =
+      (existing?.value ?? 0) + (mode === 'revenue' ? payment.amount : 1);
+
+    buckets.set(planId, {
+      planId,
+      title: payment.planTitle,
+      subtitle: payment.planSubtitle,
+      categoryTitle: payment.passPlan?.group.variant.category.title ?? null,
+      value: nextValue,
+    });
+  }
+
+  return Array.from(buckets.values())
+    .sort((left, right) => right.value - left.value)
+    .slice(0, 5)
+    .map((entry) => ({
+      ...entry,
+      value:
+        mode === 'revenue'
+          ? kopecksToRubles(entry.value)
+          : roundMetric(entry.value),
+    }));
+}
+
+function normalizeLedgerLimit(limit?: number) {
+  if (!limit || Number.isNaN(limit)) {
+    return 20;
+  }
+
+  return Math.max(1, Math.min(100, Math.trunc(limit)));
+}
+
+function encodeLedgerCursor(cursor: AdminLedgerCursor) {
+  return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
+}
+
+function decodeLedgerCursor(cursor?: string) {
+  if (!cursor) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(cursor, 'base64url').toString('utf8'),
+    ) as AdminLedgerCursor;
+
+    if (!parsed.paidAt || !parsed.id) {
+      return null;
+    }
+
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function toIsoDate(value: Date) {
+  return value.toISOString().slice(0, 10);
+}
+
+function roundMetric(value: number) {
+  return Math.round(value * 100) / 100;
 }
 
 function createPaymentId() {

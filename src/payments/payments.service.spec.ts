@@ -26,6 +26,8 @@ describe('PaymentsService', () => {
         create: jest.fn(),
         update: jest.fn(),
         findUnique: jest.fn(),
+        findMany: jest.fn(),
+        count: jest.fn(),
       },
     };
 
@@ -283,6 +285,135 @@ describe('PaymentsService', () => {
       'payment-1',
     );
   });
+
+  it('builds admin overview from paid orders only and compares with previous period', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-03-19T12:00:00.000Z'));
+    prismaService.paymentOrder.findMany.mockResolvedValue([
+      createPaymentRecord({
+        id: 'current-1',
+        passPlanId: 'plan-1',
+        amount: 500000,
+        status: PaymentOrderStatus.PAID,
+        paidAt: new Date('2026-03-18T10:00:00.000Z'),
+      }),
+      createPaymentRecord({
+        id: 'current-2',
+        passPlanId: 'plan-1',
+        amount: 300000,
+        status: PaymentOrderStatus.PAID,
+        paidAt: new Date('2026-03-17T10:00:00.000Z'),
+      }),
+      createPaymentRecord({
+        id: 'previous-1',
+        passPlanId: 'plan-2',
+        planTitle: '8 занятий',
+        amount: 200000,
+        status: PaymentOrderStatus.PAID,
+        paidAt: new Date('2026-02-15T10:00:00.000Z'),
+      }),
+    ]);
+    prismaService.paymentOrder.count.mockResolvedValue(4);
+
+    const result = await paymentsService.getAdminPaymentsOverview('30d');
+
+    expect(result.totals.grossRevenue).toBe(8000);
+    expect(result.totals.successfulPaymentsCount).toBe(2);
+    expect(result.totals.averageCheck).toBe(4000);
+    expect(result.totals.createdOrdersCount).toBe(4);
+    expect(result.totals.paidConversionRate).toBe(50);
+    expect(result.comparisons.grossRevenue.previous).toBe(2000);
+    expect(result.comparisons.grossRevenue.delta).toBe(6000);
+    expect(result.topPlans.byRevenue[0]).toEqual(
+      expect.objectContaining({
+        planId: 'plan-1',
+        value: 8000,
+      }),
+    );
+    expect(
+      result.revenueSeries.find((entry: { date: string }) => entry.date === '2026-03-18')
+        ?.value,
+    ).toBe(5000);
+
+    jest.useRealTimers();
+  });
+
+  it('returns admin ledger page with stable cursor pagination for equal paidAt timestamps', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-03-19T12:00:00.000Z'));
+    prismaService.paymentOrder.findMany.mockResolvedValueOnce([
+      createPaymentRecord({
+        id: 'payment-3',
+        paidAt: new Date('2026-03-19T10:00:00.000Z'),
+        status: PaymentOrderStatus.PAID,
+      }),
+      createPaymentRecord({
+        id: 'payment-2',
+        paidAt: new Date('2026-03-19T10:00:00.000Z'),
+        status: PaymentOrderStatus.PAID,
+      }),
+      createPaymentRecord({
+        id: 'payment-1',
+        paidAt: new Date('2026-03-18T10:00:00.000Z'),
+        status: PaymentOrderStatus.PAID,
+      }),
+    ]);
+
+    const firstPage = await paymentsService.getAdminPaymentsLedger({
+      range: '30d',
+      limit: 2,
+    });
+
+    expect(firstPage.items).toHaveLength(2);
+    expect(firstPage.items[0].paymentId).toBe('payment-3');
+    expect(firstPage.items[1].paymentId).toBe('payment-2');
+    expect(firstPage.nextCursor).toEqual(expect.any(String));
+    expect(prismaService.paymentOrder.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: PaymentOrderStatus.PAID,
+        }),
+        orderBy: [{ paidAt: 'desc' }, { id: 'desc' }],
+        take: 3,
+      }),
+    );
+
+    prismaService.paymentOrder.findMany.mockResolvedValueOnce([
+      createPaymentRecord({
+        id: 'payment-1',
+        paidAt: new Date('2026-03-18T10:00:00.000Z'),
+        status: PaymentOrderStatus.PAID,
+      }),
+    ]);
+
+    const secondPage = await paymentsService.getAdminPaymentsLedger({
+      range: '30d',
+      limit: 2,
+      cursor: firstPage.nextCursor ?? undefined,
+    });
+
+    expect(secondPage.items).toHaveLength(1);
+    expect(secondPage.items[0].paymentId).toBe('payment-1');
+    expect(prismaService.paymentOrder.findMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          OR: [
+            {
+              paidAt: {
+                lt: new Date('2026-03-19T10:00:00.000Z'),
+              },
+            },
+            {
+              paidAt: new Date('2026-03-19T10:00:00.000Z'),
+              id: {
+                lt: 'payment-2',
+              },
+            },
+          ],
+        }),
+      }),
+    );
+
+    jest.useRealTimers();
+  });
 });
 
 function createPaymentRecord(overrides: Partial<Record<string, unknown>> = {}) {
@@ -314,6 +445,25 @@ function createPaymentRecord(overrides: Partial<Record<string, unknown>> = {}) {
     paidAt: null,
     failedAt: null,
     membershipIssuedAt: null,
+    user: {
+      id: 'user-1',
+      name: 'Jane Doe',
+      email: 'user@example.com',
+    },
+    passPlan: {
+      id: 'plan-1',
+      title: '1 месяц (безлимит)',
+      subtitle: '2 гостевых визита',
+      group: {
+        title: 'Безлимит',
+        variant: {
+          title: 'Взрослые',
+          category: {
+            title: 'Бассейн',
+          },
+        },
+      },
+    },
     ...overrides,
   };
 }
