@@ -1,6 +1,7 @@
 import { NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { PassesService } from './passes.service';
+import * as uploadUtils from '../common/uploads/upload.utils';
 
 describe('PassesService', () => {
   let passesService: PassesService;
@@ -220,5 +221,74 @@ describe('PassesService', () => {
         title: 'Updated',
       }),
     ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('replaces category cover and removes previous uploaded file', async () => {
+    const deleteUploadedFileSpy = jest
+      .spyOn(uploadUtils, 'deleteUploadedFile')
+      .mockResolvedValue(undefined);
+
+    prismaService.passCategory.findUnique
+      .mockResolvedValueOnce({
+        coverImageUrl: '/uploads/passes/old-cover.jpg',
+      })
+      .mockResolvedValueOnce({
+        id: 'category-1',
+        title: 'Unlimited',
+        slug: 'unlimited',
+        description: null,
+        coverImageUrl: '/uploads/passes/new-cover.jpg',
+        sortOrder: 0,
+        isActive: true,
+        variants: [],
+      });
+    prismaService.passCategory.update.mockResolvedValue({});
+
+    const result = await passesService.updateCategoryCover(
+      'category-1',
+      '/uploads/passes/new-cover.jpg',
+    );
+
+    expect(prismaService.passCategory.update).toHaveBeenCalledWith({
+      where: { id: 'category-1' },
+      data: { coverImageUrl: '/uploads/passes/new-cover.jpg' },
+    });
+    expect(deleteUploadedFileSpy).toHaveBeenCalledWith(
+      '/uploads/passes/old-cover.jpg',
+    );
+    expect(result.coverImageUrl).toBe('/uploads/passes/new-cover.jpg');
+  });
+
+  it('removes category cover and deletes uploaded file', async () => {
+    const deleteUploadedFileSpy = jest
+      .spyOn(uploadUtils, 'deleteUploadedFile')
+      .mockResolvedValue(undefined);
+
+    prismaService.passCategory.findUnique
+      .mockResolvedValueOnce({
+        coverImageUrl: '/uploads/passes/cover.jpg',
+      })
+      .mockResolvedValueOnce({
+        id: 'category-1',
+        title: 'Unlimited',
+        slug: 'unlimited',
+        description: null,
+        coverImageUrl: null,
+        sortOrder: 0,
+        isActive: true,
+        variants: [],
+      });
+    prismaService.passCategory.update.mockResolvedValue({});
+
+    const result = await passesService.removeCategoryCover('category-1');
+
+    expect(prismaService.passCategory.update).toHaveBeenCalledWith({
+      where: { id: 'category-1' },
+      data: { coverImageUrl: null },
+    });
+    expect(deleteUploadedFileSpy).toHaveBeenCalledWith(
+      '/uploads/passes/cover.jpg',
+    );
+    expect(result.coverImageUrl).toBeNull();
   });
 });

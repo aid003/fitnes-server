@@ -10,6 +10,7 @@ import {
   rublesToKopecks,
 } from '../common/money/money';
 import { handlePrismaError } from '../common/database/prisma-errors';
+import { deleteUploadedFile } from '../common/uploads/upload.utils';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreatePassBadgeDto } from './dto/create-pass-badge.dto';
 import { CreatePassCategoryDto } from './dto/create-pass-category.dto';
@@ -224,10 +225,68 @@ export class PassesService implements OnModuleInit {
   }
 
   async deleteCategory(categoryId: string): Promise<{ success: true }> {
-    await this.ensureCategoryExists(categoryId);
+    const category = await this.prisma.passCategory.findUnique({
+      where: { id: categoryId },
+      select: { id: true, coverImageUrl: true },
+    });
+
+    if (!category) {
+      throw new NotFoundException('Pass category not found');
+    }
+
     await this.prisma.passCategory.delete({ where: { id: categoryId } });
+    await deleteUploadedFile(category.coverImageUrl);
 
     return { success: true };
+  }
+
+  async updateCategoryCover(
+    categoryId: string,
+    coverImageUrl: string,
+  ): Promise<PassCategoryDetails> {
+    const current = await this.prisma.passCategory.findUnique({
+      where: { id: categoryId },
+      select: { coverImageUrl: true },
+    });
+
+    if (!current) {
+      throw new NotFoundException('Pass category not found');
+    }
+
+    try {
+      await this.prisma.passCategory.update({
+        where: { id: categoryId },
+        data: { coverImageUrl },
+      });
+      await deleteUploadedFile(current.coverImageUrl);
+    } catch (error) {
+      handlePrismaError(error, 'Pass category');
+    }
+
+    return this.getAdminCategoryById(categoryId);
+  }
+
+  async removeCategoryCover(categoryId: string): Promise<PassCategoryDetails> {
+    const current = await this.prisma.passCategory.findUnique({
+      where: { id: categoryId },
+      select: { coverImageUrl: true },
+    });
+
+    if (!current) {
+      throw new NotFoundException('Pass category not found');
+    }
+
+    try {
+      await this.prisma.passCategory.update({
+        where: { id: categoryId },
+        data: { coverImageUrl: null },
+      });
+      await deleteUploadedFile(current.coverImageUrl);
+    } catch (error) {
+      handlePrismaError(error, 'Pass category');
+    }
+
+    return this.getAdminCategoryById(categoryId);
   }
 
   async createVariant(

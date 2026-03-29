@@ -6,11 +6,21 @@ import {
   Param,
   Patch,
   Post,
+  UploadedFile,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { diskStorage } from 'multer';
 import { UserRole } from '@prisma/client';
 import { AuthenticatedGuard } from '../common/auth/authenticated.guard';
 import { Roles } from '../common/auth/roles.decorator';
+import {
+  buildImageStorageName,
+  ensureUploadsDirectory,
+  toPublicUploadUrl,
+  validateImageFile,
+} from '../common/uploads/upload.utils';
 import { CreatePassBadgeDto } from './dto/create-pass-badge.dto';
 import { CreatePassCategoryDto } from './dto/create-pass-category.dto';
 import { CreatePassPlanGroupDto } from './dto/create-pass-plan-group.dto';
@@ -52,6 +62,48 @@ export class PassesAdminController {
   @Delete('categories/:categoryId')
   deleteCategory(@Param('categoryId') categoryId: string) {
     return this.passesService.deleteCategory(categoryId);
+  }
+
+  @Post('categories/:categoryId/cover')
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: diskStorage({
+        destination: async (_request, _file, callback) => {
+          const destination = await ensureUploadsDirectory('passes');
+          callback(null, destination);
+        },
+        filename: (_request, file, callback) => {
+          callback(null, buildImageStorageName(file.originalname));
+        },
+      }),
+      limits: {
+        fileSize: 5 * 1024 * 1024,
+      },
+    }),
+  )
+  async uploadCategoryCover(
+    @Param('categoryId') categoryId: string,
+    @UploadedFile() file?: any,
+  ) {
+    validateImageFile(file);
+    const coverImageUrl = toPublicUploadUrl('passes', file.filename);
+    const item = await this.passesService.updateCategoryCover(
+      categoryId,
+      coverImageUrl,
+    );
+    return {
+      url: item.coverImageUrl,
+      item,
+    };
+  }
+
+  @Delete('categories/:categoryId/cover')
+  async deleteCategoryCover(@Param('categoryId') categoryId: string) {
+    const item = await this.passesService.removeCategoryCover(categoryId);
+    return {
+      url: item.coverImageUrl,
+      item,
+    };
   }
 
   @Post('categories/:categoryId/variants')
