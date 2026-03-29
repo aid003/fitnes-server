@@ -11,6 +11,8 @@ import { UsersModule } from './users/users.module';
 import { PassesModule } from './passes/passes.module';
 import { ScheduleModule } from './schedule/schedule.module';
 import { PaymentsModule } from './payments/payments.module';
+import { TrainersModule } from './trainers/trainers.module';
+import { NewsModule } from './news/news.module';
 
 @Module({
   imports: [
@@ -30,6 +32,8 @@ import { PaymentsModule } from './payments/payments.module';
     MembershipsModule,
     ScheduleModule,
     PaymentsModule,
+    TrainersModule,
+    NewsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

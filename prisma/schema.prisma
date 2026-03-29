@@ -95,6 +95,41 @@ model User {
   paymentOrders       PaymentOrder[]
 }
 
+model Trainer {
+  id         String   @id @default(cuid())
+  name       String
+  slug       String   @unique
+  role       String
+  shortBio   String?
+  photoUrl   String?
+  sortOrder  Int      @default(0)
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([isActive, sortOrder, name])
+}
+
+model NewsArticle {
+  id               String   @id @default(cuid())
+  title            String
+  slug             String   @unique
+  excerpt          String?
+  coverImageUrl    String?
+  lead             String?
+  highlightsTitle  String?
+  highlights       Json?
+  contentRichText  String
+  tags             Json?
+  publishedAt      DateTime?
+  sortOrder        Int      @default(0)
+  isPublished      Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([isPublished, publishedAt, sortOrder])
+}
+
 model EmailLoginChallenge {
   id         String                @id @default(cuid())
   email      String

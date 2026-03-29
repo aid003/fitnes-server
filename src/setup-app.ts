@@ -1,8 +1,10 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import express from 'express';
 import { LoggerErrorInterceptor } from 'nestjs-pino';
 import { SessionService } from './auth/session/session.service';
+import { ensureUploadsDirectory, uploadsRoot } from './common/uploads/upload.utils';
 
 export type AppDocsConfig = {
   jsonPath: string;
@@ -25,6 +27,8 @@ export function setupApp(app: INestApplication): AppDocsConfig {
     }),
   );
   app.use(app.get(SessionService).getMiddleware());
+  void ensureUploadsDirectory();
+  app.use('/uploads', express.static(uploadsRoot));
   app.enableCors({
     origin: frontendOrigin,
     credentials: true,
