@@ -93,6 +93,7 @@ model User {
   memberships         UserMembership[]
   membershipRenewalRequests UserMembershipRenewalRequest[]
   paymentOrders       PaymentOrder[]
+  adBannerDismissals  UserAdBannerDismissal[]
 }
 
 model Trainer {
@@ -128,6 +129,37 @@ model NewsArticle {
   updatedAt        DateTime @updatedAt
 
   @@index([isPublished, publishedAt, sortOrder])
+}
+
+model AdBanner {
+  id                 String                  @id @default(cuid())
+  title              String
+  imageUrl           String?
+  targetUrl          String
+  startsAt           DateTime
+  endsAt             DateTime
+  repeatIntervalDays Int
+  sortOrder          Int                     @default(0)
+  isActive           Boolean                 @default(true)
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+  dismissals         UserAdBannerDismissal[]
+
+  @@index([isActive, startsAt, endsAt, sortOrder])
+}
+
+model UserAdBannerDismissal {
+  id         String   @id @default(cuid())
+  userId     String
+  bannerId   String
+  dismissedAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  banner      AdBanner @relation(fields: [bannerId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, bannerId])
+  @@index([bannerId, dismissedAt])
 }
 
 model EmailLoginChallenge {

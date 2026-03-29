@@ -13,6 +13,7 @@ import { ScheduleModule } from './schedule/schedule.module';
 import { PaymentsModule } from './payments/payments.module';
 import { TrainersModule } from './trainers/trainers.module';
 import { NewsModule } from './news/news.module';
+import { AdsModule } from './ads/ads.module';
 
 @Module({
   imports: [
@@ -34,6 +35,7 @@ import { NewsModule } from './news/news.module';
     PaymentsModule,
     TrainersModule,
     NewsModule,
+    AdsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
