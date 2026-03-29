@@ -6,3 +6,7 @@ ADD COLUMN     "lastSentAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 ADD COLUMN     "purpose" "EmailChallengePurpose" NOT NULL DEFAULT 'PASSWORD_RECOVERY';
 
 CREATE UNIQUE INDEX "EmailLoginChallenge_email_purpose_key" ON "EmailLoginChallenge"("email", "purpose");
+
+ALTER TABLE "EmailLoginChallenge"
+ALTER COLUMN "lastSentAt" DROP DEFAULT,
+ALTER COLUMN "purpose" DROP DEFAULT;

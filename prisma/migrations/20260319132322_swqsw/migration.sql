@@ -1,3 +1,2 @@
--- AlterTable
-ALTER TABLE "EmailLoginChallenge" ALTER COLUMN "lastSentAt" DROP DEFAULT,
-ALTER COLUMN "purpose" DROP DEFAULT;
+-- This migration was created before "lastSentAt" and "purpose" were added.
+-- Keep it as a no-op so a full migration replay can succeed on a shadow DB.
