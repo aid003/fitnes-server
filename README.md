@@ -39,6 +39,22 @@ Set `MEMBERSHIP_QR_SECRET` for signing membership QR payloads. Use a long random
 openssl rand -hex 32
 ```
 
+Configure T-Bank internet acquiring before running payment flows:
+
+```bash
+TBANK_TERMINAL_KEY=
+TBANK_PASSWORD=
+TBANK_API_URL=https://securepay.tinkoff.ru/v2
+TBANK_NOTIFICATION_URL=
+TBANK_SUCCESS_URL=
+TBANK_FAIL_URL=
+TBANK_PAYMENT_TTL_MINUTES=
+TBANK_TAXATION=
+TBANK_RECEIPT_EMAIL_FALLBACK=
+```
+
+`TBANK_NOTIFICATION_URL` must point to `POST /payments/webhooks/tbank` and your server must answer with HTTP `200` and body `OK`.
+
 ## Compile and run the project
 
 ```bash

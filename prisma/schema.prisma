@@ -58,11 +58,31 @@ enum MembershipRenewalStatus {
 enum PaymentOrderStatus {
   CREATED
   FORM_REGISTERED
+  REDIRECT_READY
   REDIRECTED
+  PROCESSING
   PAID
+  REFUNDED
   FAILED
   EXPIRED
   CANCELLED
+}
+
+enum PaymentGatewayProvider {
+  ALFA
+  TBANK
+}
+
+enum PaymentOrderEventType {
+  INIT_REQUEST
+  INIT_RESPONSE
+  GET_STATE_REQUEST
+  GET_STATE_RESPONSE
+  WEBHOOK_RECEIVED
+  WEBHOOK_REJECTED
+  REFUND_REQUEST
+  REFUND_RESPONSE
+  STATUS_SYNC
 }
 
 enum ScheduleWeekday {
@@ -323,17 +343,24 @@ model PaymentOrder {
   userId                String
   passPlanId            String
   membershipId          String?
+  gatewayProvider       PaymentGatewayProvider @default(ALFA)
   merchantOrderNumber   String             @unique
   gatewayOrderId        String?            @unique
+  gatewayPaymentId      String?            @unique
   /// Canonical payment amount in kopecks.
   amount                Int
   currency              String             @default("RUB")
   status                PaymentOrderStatus @default(CREATED)
   gatewayOrderStatus    Int?
   gatewayPaymentState   String?
+  gatewayStatus         String?
+  gatewayErrorCode      String?
+  gatewayMessage        String?
+  gatewayDetails        String?
   actionCode            Int?
   actionCodeDescription String?
   formUrl               String?
+  paymentUrl            String?
   returnUrl             String
   failUrl               String
   planTitle             String
@@ -342,19 +369,44 @@ model PaymentOrder {
   payerEmail            String?
   payerPhone            String?
   fiscalPayload         Json?
+  receiptPayload        Json?
+  refundedAmount        Int                @default(0)
+  notificationTokenValid Boolean?
+  lastNotificationAt    DateTime?
   createdAt             DateTime           @default(now())
   updatedAt             DateTime           @updatedAt
   redirectedAt          DateTime?
   paidAt                DateTime?
   failedAt              DateTime?
+  refundedAt            DateTime?
   membershipIssuedAt    DateTime?
   user                  User               @relation(fields: [userId], references: [id], onDelete: Cascade)
   passPlan              PassPlan           @relation(fields: [passPlanId], references: [id], onDelete: Restrict)
   membership            UserMembership?    @relation(fields: [membershipId], references: [id], onDelete: SetNull)
+  events                PaymentOrderEvent[]
 
   @@index([userId, createdAt])
   @@index([passPlanId, createdAt])
   @@index([status, createdAt])
+  @@index([gatewayProvider, createdAt])
+  @@index([gatewayPaymentId])
+  @@index([gatewayStatus, createdAt])
+}
+
+model PaymentOrderEvent {
+  id             String                @id @default(cuid())
+  paymentOrderId String
+  type           PaymentOrderEventType
+  gatewayStatus  String?
+  success        Boolean?
+  errorCode      String?
+  message        String?
+  payload        Json?
+  createdAt      DateTime              @default(now())
+  paymentOrder   PaymentOrder          @relation(fields: [paymentOrderId], references: [id], onDelete: Cascade)
+
+  @@index([paymentOrderId, createdAt])
+  @@index([type, createdAt])
 }
 
 model ScheduleTemplateSlot {

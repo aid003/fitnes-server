@@ -1,39 +1,48 @@
 import {
   BadGatewayException,
+  BadRequestException,
   ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { PaymentOrderStatus, Prisma } from '@prisma/client';
-import { randomUUID } from 'node:crypto';
 import {
-  kopecksToRubles,
-  toGatewayAmount,
-} from '../common/money/money';
+  PaymentOrderStatus,
+  Prisma,
+} from '@prisma/client';
+import { createHash, randomUUID } from 'node:crypto';
+import { kopecksToRubles } from '../common/money/money';
 import { MembershipsService } from '../memberships/memberships.service';
 import { PrismaService } from '../prisma/prisma.service';
 
-const DEFAULT_SESSION_TIMEOUT_SECS = 20 * 60;
-const ALFA_LANGUAGE = 'ru';
-const ALFA_CURRENCY_CODE = '810';
+const DEFAULT_PAYMENT_TTL_MINUTES = 60;
+const DEFAULT_TBANK_API_URL = 'https://securepay.tinkoff.ru/v2';
+const DEFAULT_RECEIPT_TAXATION = 'osn';
+const DEFAULT_RECEIPT_TAX = 'none';
 
 const paymentSelect = {
   id: true,
   userId: true,
   passPlanId: true,
   membershipId: true,
+  gatewayProvider: true,
   merchantOrderNumber: true,
   gatewayOrderId: true,
+  gatewayPaymentId: true,
   amount: true,
   currency: true,
   status: true,
   gatewayOrderStatus: true,
   gatewayPaymentState: true,
+  gatewayStatus: true,
+  gatewayErrorCode: true,
+  gatewayMessage: true,
+  gatewayDetails: true,
   actionCode: true,
   actionCodeDescription: true,
   formUrl: true,
+  paymentUrl: true,
   returnUrl: true,
   failUrl: true,
   planTitle: true,
@@ -41,11 +50,17 @@ const paymentSelect = {
   planDescription: true,
   payerEmail: true,
   payerPhone: true,
+  fiscalPayload: true,
+  receiptPayload: true,
+  refundedAmount: true,
+  notificationTokenValid: true,
+  lastNotificationAt: true,
   createdAt: true,
   updatedAt: true,
   redirectedAt: true,
   paidAt: true,
   failedAt: true,
+  refundedAt: true,
   membershipIssuedAt: true,
   user: {
     select: {
@@ -59,6 +74,9 @@ const paymentSelect = {
       id: true,
       title: true,
       subtitle: true,
+      billingType: true,
+      durationValue: true,
+      durationUnit: true,
       group: {
         select: {
           title: true,
@@ -78,31 +96,23 @@ const paymentSelect = {
   },
 } satisfies Prisma.PaymentOrderSelect;
 
+const paymentDetailSelect = {
+  ...paymentSelect,
+  events: {
+    orderBy: {
+      createdAt: 'desc',
+    },
+    take: 50,
+  },
+} satisfies Prisma.PaymentOrderSelect;
+
 type PaymentRecord = Prisma.PaymentOrderGetPayload<{
   select: typeof paymentSelect;
 }>;
 
-type AlfaRegisterResponse = {
-  orderId?: string;
-  formUrl?: string;
-  errorCode?: string | number;
-  errorMessage?: string;
-};
-
-type AlfaStatusResponse = {
-  errorCode?: string | number;
-  errorMessage?: string;
-  orderNumber?: string;
-  orderStatus?: number;
-  actionCode?: string | number;
-  actionCodeDescription?: string;
-  paymentAmountInfo?: {
-    paymentState?: string;
-    approvedAmount?: number;
-    depositedAmount?: number;
-    refundedAmount?: number;
-  };
-};
+type PaymentDetailRecord = Prisma.PaymentOrderGetPayload<{
+  select: typeof paymentDetailSelect;
+}>;
 
 type AdminPaymentsRange = {
   key: '30d';
@@ -111,8 +121,52 @@ type AdminPaymentsRange = {
 };
 
 type AdminLedgerCursor = {
-  paidAt: string;
+  createdAt: string;
   id: string;
+};
+
+type TBankInitResponse = {
+  Success?: boolean;
+  ErrorCode?: string;
+  Message?: string;
+  Details?: string;
+  Status?: string;
+  PaymentId?: string | number;
+  PaymentURL?: string;
+};
+
+type TBankGetStateResponse = {
+  Success?: boolean;
+  ErrorCode?: string;
+  Message?: string;
+  Details?: string;
+  Status?: string;
+  PaymentId?: string | number;
+  OrderId?: string;
+  Amount?: number;
+};
+
+type TBankCancelResponse = {
+  Success?: boolean;
+  ErrorCode?: string;
+  Message?: string;
+  Details?: string;
+  Status?: string;
+  PaymentId?: string | number;
+  OriginalAmount?: number;
+  NewAmount?: number;
+};
+
+type TBankNotification = Record<string, unknown> & {
+  Token?: string;
+  Status?: string;
+  PaymentId?: string | number;
+  ErrorCode?: string | number;
+  Message?: string;
+  Details?: string;
+  Success?: boolean;
+  Amount?: number;
+  OrderId?: string;
 };
 
 @Injectable()
@@ -131,6 +185,7 @@ export class PaymentsService {
       select: {
         id: true,
         email: true,
+        name: true,
       },
     });
 
@@ -159,6 +214,9 @@ export class PaymentsService {
         description: true,
         price: true,
         currency: true,
+        billingType: true,
+        durationValue: true,
+        durationUnit: true,
         group: {
           select: {
             title: true,
@@ -181,19 +239,26 @@ export class PaymentsService {
       throw new NotFoundException('Pass plan not found');
     }
 
+    if (passPlan.currency !== 'RUB') {
+      throw new BadRequestException('Only RUB payments are supported');
+    }
+
     const merchantOrderNumber = buildMerchantOrderNumber();
     const paymentId = createPaymentId();
     const returnUrl = this.buildResultUrl(paymentId, 'success');
     const failUrl = this.buildResultUrl(paymentId, 'fail');
-    const expiresAt = new Date(
-      Date.now() + this.resolveSessionTimeoutSecs() * 1000,
-    );
+    const expiresAt = addMinutes(new Date(), this.resolvePaymentTtlMinutes());
+    const receiptPayload = this.buildReceiptPayload({
+      user,
+      passPlan,
+    });
 
     const created = await this.prisma.paymentOrder.create({
       data: {
         id: paymentId,
         userId,
         passPlanId: passPlan.id,
+        gatewayProvider: 'TBANK',
         merchantOrderNumber,
         amount: passPlan.price,
         currency: passPlan.currency,
@@ -204,140 +269,174 @@ export class PaymentsService {
         planSubtitle: passPlan.subtitle,
         planDescription: passPlan.description,
         payerEmail: user.email,
-        fiscalPayload: {
-          customer: {
-            email: user.email,
-          },
-          items: [],
-        },
+        receiptPayload,
+        fiscalPayload: receiptPayload,
       },
       select: paymentSelect,
     });
 
-    let registerResponse: AlfaRegisterResponse;
+    await this.appendEvent(created.id, 'INIT_REQUEST', {
+      payload: {
+        paymentId: created.id,
+        merchantOrderNumber: created.merchantOrderNumber,
+        amount: created.amount,
+      },
+      success: true,
+    });
+
+    let initResponse: TBankInitResponse;
 
     try {
-      registerResponse = await this.registerOrder(created);
+      initResponse = await this.initGatewayPayment(created, expiresAt);
     } catch (error) {
       await this.prisma.paymentOrder.update({
         where: { id: created.id },
         data: {
           status: PaymentOrderStatus.FAILED,
           failedAt: new Date(),
+          gatewayErrorCode: 'NETWORK_ERROR',
+          gatewayMessage:
+            error instanceof Error ? error.message : 'Payment initialization failed',
           actionCodeDescription:
-            error instanceof Error
-              ? error.message
-              : 'Payment registration failed',
+            error instanceof Error ? error.message : 'Payment initialization failed',
         },
+      });
+
+      await this.appendEvent(created.id, 'INIT_RESPONSE', {
+        success: false,
+        errorCode: 'NETWORK_ERROR',
+        message:
+          error instanceof Error ? error.message : 'Payment initialization failed',
       });
 
       throw error;
     }
 
+    await this.appendEvent(created.id, 'INIT_RESPONSE', {
+      gatewayStatus: initResponse.Status,
+      success: Boolean(initResponse.Success),
+      errorCode: toOptionalString(initResponse.ErrorCode),
+      message: initResponse.Message ?? initResponse.Details ?? null,
+      payload: initResponse,
+    });
+
     if (
-      normalizeNumeric(registerResponse.errorCode) !== 0 ||
-      !registerResponse.orderId ||
-      !registerResponse.formUrl
+      !initResponse.Success ||
+      !initResponse.PaymentId ||
+      !initResponse.PaymentURL
     ) {
       await this.prisma.paymentOrder.update({
         where: { id: created.id },
         data: {
           status: PaymentOrderStatus.FAILED,
           failedAt: new Date(),
-          actionCode: normalizeNullableNumber(registerResponse.errorCode),
+          gatewayStatus: initResponse.Status ?? null,
+          gatewayErrorCode: toOptionalString(initResponse.ErrorCode),
+          gatewayMessage: initResponse.Message ?? null,
+          gatewayDetails: initResponse.Details ?? null,
           actionCodeDescription:
-            registerResponse.errorMessage ?? 'Payment registration failed',
+            initResponse.Message ??
+            initResponse.Details ??
+            'Payment initialization failed',
         },
       });
 
       throw new BadGatewayException(
-        mapGatewayRegistrationError(
-          registerResponse.errorCode,
-          registerResponse.errorMessage,
-        ),
+        initResponse.Message ??
+          initResponse.Details ??
+          'Payment initialization failed',
       );
     }
 
     await this.prisma.paymentOrder.update({
       where: { id: created.id },
       data: {
-        gatewayOrderId: registerResponse.orderId,
-        formUrl: registerResponse.formUrl,
-        status: PaymentOrderStatus.FORM_REGISTERED,
+        gatewayPaymentId: String(initResponse.PaymentId),
+        gatewayStatus: initResponse.Status ?? 'NEW',
+        paymentUrl: initResponse.PaymentURL,
+        formUrl: initResponse.PaymentURL,
+        gatewayErrorCode: toOptionalString(initResponse.ErrorCode),
+        gatewayMessage: initResponse.Message ?? null,
+        gatewayDetails: initResponse.Details ?? null,
+        status: PaymentOrderStatus.REDIRECT_READY,
       },
     });
 
     return {
       paymentId: created.id,
-      formUrl: registerResponse.formUrl,
+      formUrl: initResponse.PaymentURL,
       expiresAt: expiresAt.toISOString(),
     };
   }
 
   async getPaymentStatus(userId: string, paymentId: string) {
     const payment = await this.getPaymentForUser(userId, paymentId);
-
     return this.mapPaymentStatus(payment);
   }
 
   async confirmPayment(userId: string, paymentId: string) {
     const payment = await this.getPaymentForUser(userId, paymentId);
+    return this.syncPaymentStatus(payment);
+  }
 
-    if (!payment.gatewayOrderId) {
-      return this.mapPaymentStatus(payment);
+  async handleTBankWebhook(notification: TBankNotification) {
+    const gatewayPaymentId = notification.PaymentId
+      ? String(notification.PaymentId)
+      : null;
+    const payment = gatewayPaymentId
+      ? await this.prisma.paymentOrder.findFirst({
+          where: {
+            gatewayProvider: 'TBANK',
+            gatewayPaymentId,
+          },
+          select: paymentSelect,
+        })
+      : null;
+
+    const isTokenValid = this.isValidTBankToken(notification);
+
+    if (!payment) {
+      this.logger.warn(
+        { gatewayPaymentId, orderId: notification.OrderId, isTokenValid },
+        'T-Bank webhook received for unknown payment',
+      );
+      return 'OK';
     }
 
-    const statusResponse = await this.fetchGatewayStatus(
-      payment.gatewayOrderId,
+    await this.appendEvent(
+      payment.id,
+      isTokenValid
+        ? 'WEBHOOK_RECEIVED'
+        : 'WEBHOOK_REJECTED',
+      {
+        gatewayStatus: toOptionalString(notification.Status),
+        success: Boolean(notification.Success),
+        errorCode: toOptionalString(notification.ErrorCode),
+        message:
+          toOptionalString(notification.Message) ??
+          toOptionalString(notification.Details),
+        payload: notification,
+      },
     );
-    const nextState = resolvePaymentState(statusResponse, payment);
 
-    const synced = await this.prisma.paymentOrder.update({
+    await this.prisma.paymentOrder.update({
       where: { id: payment.id },
       data: {
-        status: nextState.status,
-        gatewayOrderStatus: nextState.gatewayOrderStatus,
-        gatewayPaymentState: nextState.gatewayPaymentState,
-        actionCode: nextState.actionCode,
-        actionCodeDescription: nextState.actionCodeDescription,
-        redirectedAt: payment.redirectedAt ?? new Date(),
-        paidAt: nextState.paidAt ?? payment.paidAt,
-        failedAt: nextState.failedAt ?? payment.failedAt,
+        lastNotificationAt: new Date(),
+        notificationTokenValid: isTokenValid,
       },
-      select: paymentSelect,
     });
 
-    let finalPayment = synced;
-
-    if (shouldIssueMembership(synced)) {
-      const membership =
-        await this.membershipsService.issueMembershipFromPayment({
-          userId: synced.userId,
-          passPlanId: synced.passPlanId,
-          paidAt: synced.paidAt ?? new Date(),
-          title: synced.planTitle,
-          subtitle: synced.planSubtitle,
-          description: synced.planDescription,
-        });
-
-      finalPayment = await this.prisma.paymentOrder.update({
-        where: { id: synced.id },
-        data: {
-          membershipId: membership.id,
-          membershipIssuedAt: new Date(),
-        },
-        select: paymentSelect,
-      });
-
-      await this.attachQrSnapshotSafely(membership.id, finalPayment.id);
-    } else if (
-      synced.status === PaymentOrderStatus.PAID &&
-      synced.membershipId
-    ) {
-      await this.attachQrSnapshotSafely(synced.membershipId, synced.id);
+    if (!isTokenValid) {
+      return 'OK';
     }
 
-    return this.mapPaymentStatus(finalPayment);
+    const synced = await this.applyGatewaySnapshot(payment, notification, {
+      markRedirected: true,
+    });
+    await this.issueMembershipIfNeeded(synced);
+
+    return 'OK';
   }
 
   async getAdminPaymentsOverview(rangeKey?: string) {
@@ -346,33 +445,33 @@ export class PaymentsService {
 
     const [paidPayments, createdOrdersCount, previousCreatedOrdersCount] =
       await Promise.all([
-      this.prisma.paymentOrder.findMany({
-        where: {
-          status: PaymentOrderStatus.PAID,
-          paidAt: {
-            gte: boundaries.previousStart,
-            lt: boundaries.currentEndExclusive,
+        this.prisma.paymentOrder.findMany({
+          where: {
+            status: PaymentOrderStatus.PAID,
+            paidAt: {
+              gte: boundaries.previousStart,
+              lt: boundaries.currentEndExclusive,
+            },
           },
-        },
-        select: paymentSelect,
-      }),
-      this.prisma.paymentOrder.count({
-        where: {
-          createdAt: {
-            gte: boundaries.currentStart,
-            lt: boundaries.currentEndExclusive,
+          select: paymentSelect,
+        }),
+        this.prisma.paymentOrder.count({
+          where: {
+            createdAt: {
+              gte: boundaries.currentStart,
+              lt: boundaries.currentEndExclusive,
+            },
           },
-        },
-      }),
-      this.prisma.paymentOrder.count({
-        where: {
-          createdAt: {
-            gte: boundaries.previousStart,
-            lt: boundaries.previousEndExclusive,
+        }),
+        this.prisma.paymentOrder.count({
+          where: {
+            createdAt: {
+              gte: boundaries.previousStart,
+              lt: boundaries.previousEndExclusive,
+            },
           },
-        },
-      }),
-    ]);
+        }),
+      ]);
 
     const currentPaid = paidPayments.filter(
       (payment) =>
@@ -391,31 +490,6 @@ export class PaymentsService {
     const previousMetrics = summarizePayments(
       previousPaid,
       previousCreatedOrdersCount,
-    );
-    const revenueSeries = buildDailySeries(
-      currentPaid,
-      boundaries.currentStart,
-      range.days,
-      'revenue',
-    );
-    const paymentsSeries = buildDailySeries(
-      currentPaid,
-      boundaries.currentStart,
-      range.days,
-      'count',
-    );
-
-    const currentWeekPayments = currentPaid.filter(
-      (payment) =>
-        payment.paidAt &&
-        payment.paidAt >= boundaries.currentWeekStart &&
-        payment.paidAt < boundaries.currentWeekEndExclusive,
-    );
-    const previousWeekPayments = paidPayments.filter(
-      (payment) =>
-        payment.paidAt &&
-        payment.paidAt >= boundaries.previousWeekStart &&
-        payment.paidAt < boundaries.previousWeekEndExclusive,
     );
 
     return {
@@ -441,11 +515,35 @@ export class PaymentsService {
           previousMetrics.paidConversionRate,
         ),
       },
-      revenueSeries,
-      paymentsSeries,
+      revenueSeries: buildDailySeries(
+        currentPaid,
+        boundaries.currentStart,
+        range.days,
+        'revenue',
+      ),
+      paymentsSeries: buildDailySeries(
+        currentPaid,
+        boundaries.currentStart,
+        range.days,
+        'count',
+      ),
       weeklyComparison: {
-        currentWeek: summarizeWeek(currentWeekPayments),
-        previousWeek: summarizeWeek(previousWeekPayments),
+        currentWeek: summarizeWeek(
+          currentPaid.filter(
+            (payment) =>
+              payment.paidAt &&
+              payment.paidAt >= boundaries.currentWeekStart &&
+              payment.paidAt < boundaries.currentWeekEndExclusive,
+          ),
+        ),
+        previousWeek: summarizeWeek(
+          paidPayments.filter(
+            (payment) =>
+              payment.paidAt &&
+              payment.paidAt >= boundaries.previousWeekStart &&
+              payment.paidAt < boundaries.previousWeekEndExclusive,
+          ),
+        ),
       },
       topPlans: {
         byRevenue: buildTopPlans(currentPaid, 'revenue'),
@@ -467,12 +565,12 @@ export class PaymentsService {
       ? {
           OR: [
             {
-              paidAt: {
-                lt: new Date(cursor.paidAt),
+              createdAt: {
+                lt: new Date(cursor.createdAt),
               },
             },
             {
-              paidAt: new Date(cursor.paidAt),
+              createdAt: new Date(cursor.createdAt),
               id: {
                 lt: cursor.id,
               },
@@ -483,14 +581,16 @@ export class PaymentsService {
 
     const records = await this.prisma.paymentOrder.findMany({
       where: {
-        status: PaymentOrderStatus.PAID,
-        paidAt: {
+        createdAt: {
           gte: boundaries.currentStart,
           lt: boundaries.currentEndExclusive,
         },
+        status: {
+          not: PaymentOrderStatus.CREATED,
+        },
         ...cursorWhere,
       },
-      orderBy: [{ paidAt: 'desc' }, { id: 'desc' }],
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
       select: paymentSelect,
     });
@@ -498,10 +598,15 @@ export class PaymentsService {
     const items = records.slice(0, limit).map((payment) => ({
       paymentId: payment.id,
       merchantOrderNumber: payment.merchantOrderNumber,
-      paidAt: payment.paidAt?.toISOString() ?? payment.createdAt.toISOString(),
+      paidAt: resolveLedgerTimestamp(payment),
       amount: kopecksToRubles(payment.amount),
       currency: payment.currency,
       status: payment.status,
+      gatewayProvider: payment.gatewayProvider,
+      gatewayPaymentId: payment.gatewayPaymentId,
+      gatewayStatus: payment.gatewayStatus,
+      refundedAmount: kopecksToRubles(payment.refundedAmount),
+      canRefund: canRefund(payment),
       user: payment.user,
       plan: {
         id: payment.passPlan?.id ?? payment.passPlanId,
@@ -523,17 +628,195 @@ export class PaymentsService {
       nextCursor:
         records.length > limit && lastItem
           ? encodeLedgerCursor({
-              paidAt: lastItem.paidAt,
+              createdAt: records[limit - 1].createdAt.toISOString(),
               id: lastItem.paymentId,
             })
           : null,
     };
   }
 
-  private async attachQrSnapshotSafely(
-    membershipId: string,
-    paymentId: string,
-  ) {
+  async getAdminPaymentDetails(paymentId: string) {
+    const payment = await this.prisma.paymentOrder.findUnique({
+      where: { id: paymentId },
+      select: paymentDetailSelect,
+    });
+
+    if (!payment) {
+      throw new NotFoundException('Payment not found');
+    }
+
+    return {
+      ...this.mapPaymentStatus(payment),
+      gatewayProvider: payment.gatewayProvider,
+      gatewayPaymentId: payment.gatewayPaymentId,
+      gatewayOrderId: payment.gatewayOrderId,
+      gatewayStatus: payment.gatewayStatus,
+      gatewayErrorCode: payment.gatewayErrorCode,
+      gatewayMessage: payment.gatewayMessage,
+      gatewayDetails: payment.gatewayDetails,
+      refundedAmount: kopecksToRubles(payment.refundedAmount),
+      refundedAt: payment.refundedAt?.toISOString() ?? null,
+      notificationTokenValid: payment.notificationTokenValid,
+      lastNotificationAt: payment.lastNotificationAt?.toISOString() ?? null,
+      receiptPayload: payment.receiptPayload,
+      user: payment.user,
+      plan: {
+        id: payment.passPlan?.id ?? payment.passPlanId,
+        title: payment.planTitle,
+        subtitle: payment.planSubtitle,
+        categoryTitle: payment.passPlan?.group.variant.category.title ?? null,
+        variantTitle: payment.passPlan?.group.variant.title ?? null,
+        groupTitle: payment.passPlan?.group.title ?? null,
+      },
+      events: payment.events.map((event) => ({
+        id: event.id,
+        type: event.type,
+        gatewayStatus: event.gatewayStatus,
+        success: event.success,
+        errorCode: event.errorCode,
+        message: event.message,
+        payload: event.payload,
+        createdAt: event.createdAt.toISOString(),
+      })),
+      canRefund: canRefund(payment),
+    };
+  }
+
+  async refundAdminPayment(paymentId: string) {
+    const payment = await this.prisma.paymentOrder.findUnique({
+      where: { id: paymentId },
+      select: paymentSelect,
+    });
+
+    if (!payment) {
+      throw new NotFoundException('Payment not found');
+    }
+
+    if (payment.gatewayProvider !== 'TBANK') {
+      throw new BadRequestException('Legacy gateway refunds are not supported');
+    }
+
+    if (payment.status === PaymentOrderStatus.REFUNDED) {
+      return this.getAdminPaymentDetails(payment.id);
+    }
+
+    if (!canRefund(payment)) {
+      throw new BadRequestException('Payment cannot be refunded');
+    }
+
+    if (!payment.gatewayPaymentId) {
+      throw new BadRequestException('Gateway payment id is missing');
+    }
+
+    await this.appendEvent(payment.id, 'REFUND_REQUEST', {
+      success: true,
+      payload: {
+        gatewayPaymentId: payment.gatewayPaymentId,
+        amount: payment.amount,
+      },
+    });
+
+    const response = await this.cancelGatewayPayment(payment);
+
+    await this.appendEvent(payment.id, 'REFUND_RESPONSE', {
+      gatewayStatus: response.Status,
+      success: Boolean(response.Success),
+      errorCode: toOptionalString(response.ErrorCode),
+      message: response.Message ?? response.Details ?? null,
+      payload: response,
+    });
+
+    if (!response.Success) {
+      await this.prisma.paymentOrder.update({
+        where: { id: payment.id },
+        data: {
+          gatewayStatus: response.Status ?? payment.gatewayStatus,
+          gatewayErrorCode: toOptionalString(response.ErrorCode),
+          gatewayMessage: response.Message ?? null,
+          gatewayDetails: response.Details ?? null,
+        },
+      });
+
+      throw new BadGatewayException(
+        response.Message ?? response.Details ?? 'Refund request failed',
+      );
+    }
+
+    const updated = await this.applyGatewaySnapshot(payment, response, {
+      markRedirected: false,
+      refundedAmount: payment.amount,
+    });
+
+    return this.getAdminPaymentDetails(updated.id);
+  }
+
+  private async syncPaymentStatus(payment: PaymentRecord) {
+    if (payment.gatewayProvider !== 'TBANK') {
+      return this.mapPaymentStatus(payment);
+    }
+
+    if (!payment.gatewayPaymentId) {
+      return this.mapPaymentStatus(payment);
+    }
+
+    await this.appendEvent(payment.id, 'GET_STATE_REQUEST', {
+      success: true,
+      payload: {
+        gatewayPaymentId: payment.gatewayPaymentId,
+      },
+    });
+
+    const response = await this.getGatewayPaymentState(payment.gatewayPaymentId);
+
+    await this.appendEvent(payment.id, 'GET_STATE_RESPONSE', {
+      gatewayStatus: response.Status,
+      success: Boolean(response.Success),
+      errorCode: toOptionalString(response.ErrorCode),
+      message: response.Message ?? response.Details ?? null,
+      payload: response,
+    });
+
+    const synced = await this.applyGatewaySnapshot(payment, response, {
+      markRedirected: true,
+    });
+    const finalPayment = await this.issueMembershipIfNeeded(synced);
+
+    return this.mapPaymentStatus(finalPayment);
+  }
+
+  private async issueMembershipIfNeeded(payment: PaymentRecord) {
+    if (!shouldIssueMembership(payment)) {
+      if (payment.status === PaymentOrderStatus.PAID && payment.membershipId) {
+        await this.attachQrSnapshotSafely(payment.membershipId, payment.id);
+      }
+
+      return payment;
+    }
+
+    const membership = await this.membershipsService.issueMembershipFromPayment({
+      userId: payment.userId,
+      passPlanId: payment.passPlanId,
+      paidAt: payment.paidAt ?? new Date(),
+      title: payment.planTitle,
+      subtitle: payment.planSubtitle,
+      description: payment.planDescription,
+    });
+
+    const updated = await this.prisma.paymentOrder.update({
+      where: { id: payment.id },
+      data: {
+        membershipId: membership.id,
+        membershipIssuedAt: new Date(),
+      },
+      select: paymentSelect,
+    });
+
+    await this.attachQrSnapshotSafely(membership.id, payment.id);
+
+    return updated;
+  }
+
+  private async attachQrSnapshotSafely(membershipId: string, paymentId: string) {
     try {
       await this.membershipsService.attachQrSnapshotFromPayment(
         membershipId,
@@ -551,7 +834,7 @@ export class PaymentsService {
           membershipId,
           ...details,
         },
-        'Failed to attach membership QR snapshot after successful payment',
+        'Failed to attach membership QR snapshot after payment sync',
       );
     }
   }
@@ -573,91 +856,172 @@ export class PaymentsService {
     return payment;
   }
 
-  private async registerOrder(payment: PaymentRecord) {
-    return this.callAlfa<AlfaRegisterResponse>('register.do', {
-      orderNumber: payment.merchantOrderNumber,
-      amount: toGatewayAmount(payment.amount, payment.currency),
-      currency: ALFA_CURRENCY_CODE,
-      returnUrl: payment.returnUrl,
-      failUrl: payment.failUrl,
-      pageView: 'MOBILE',
-      language: ALFA_LANGUAGE,
-      email: payment.payerEmail ?? undefined,
-      jsonParams: JSON.stringify({
+  private buildReceiptPayload(input: {
+    user: { email: string; name?: string | null };
+    passPlan: {
+      title: string;
+      price: number;
+      description?: string | null;
+    };
+  }) {
+    const receiptEmail =
+      input.user.email ||
+      this.configService.get<string>('TBANK_RECEIPT_EMAIL_FALLBACK') ||
+      null;
+
+    return {
+      Email: receiptEmail,
+      Taxation:
+        this.configService.get<string>('TBANK_TAXATION') ??
+        DEFAULT_RECEIPT_TAXATION,
+      Items: [
+        {
+          Name: sanitizeReceiptItemName(input.passPlan.title),
+          Price: input.passPlan.price,
+          Quantity: 1,
+          Amount: input.passPlan.price,
+          Tax: DEFAULT_RECEIPT_TAX,
+          PaymentMethod: 'full_payment',
+          PaymentObject: 'service',
+        },
+      ],
+    };
+  }
+
+  private buildInitPayload(payment: PaymentRecord, expiresAt: Date) {
+    return {
+      TerminalKey: this.getRequiredConfig('TBANK_TERMINAL_KEY'),
+      Amount: payment.amount,
+      OrderId: payment.merchantOrderNumber,
+      Description: sanitizeDescription(payment.planTitle),
+      NotificationURL: this.getRequiredConfig('TBANK_NOTIFICATION_URL'),
+      SuccessURL:
+        this.configService.get<string>('TBANK_SUCCESS_URL') ?? payment.returnUrl,
+      FailURL:
+        this.configService.get<string>('TBANK_FAIL_URL') ?? payment.failUrl,
+      RedirectDueDate: expiresAt.toISOString(),
+      DATA: {
         paymentId: payment.id,
         userId: payment.userId,
         passPlanId: payment.passPlanId,
         email: payment.payerEmail ?? undefined,
-      }),
-      sessionTimeoutSecs: String(this.resolveSessionTimeoutSecs()),
-      description: sanitizeDescription(payment.planTitle),
+      },
+      Receipt: payment.receiptPayload ?? undefined,
+    };
+  }
+
+  private async initGatewayPayment(payment: PaymentRecord, expiresAt: Date) {
+    const payload = this.buildInitPayload(payment, expiresAt);
+    return this.callTBank<TBankInitResponse>('Init', payload);
+  }
+
+  private async getGatewayPaymentState(gatewayPaymentId: string) {
+    return this.callTBank<TBankGetStateResponse>('GetState', {
+      TerminalKey: this.getRequiredConfig('TBANK_TERMINAL_KEY'),
+      PaymentId: gatewayPaymentId,
     });
   }
 
-  private async fetchGatewayStatus(orderId: string) {
-    return this.callAlfa<AlfaStatusResponse>('getOrderStatusExtended.do', {
-      orderId,
-      language: ALFA_LANGUAGE,
+  private async cancelGatewayPayment(payment: PaymentRecord) {
+    return this.callTBank<TBankCancelResponse>('Cancel', {
+      TerminalKey: this.getRequiredConfig('TBANK_TERMINAL_KEY'),
+      PaymentId: payment.gatewayPaymentId,
+      Amount: payment.amount,
+      Receipt: payment.receiptPayload ?? undefined,
+      ExternalRequestId: randomUUID(),
     });
   }
 
-  private async callAlfa<T>(
+  private async callTBank<T>(
     method: string,
-    params: Record<string, string | undefined>,
+    payload: Record<string, unknown>,
   ) {
-    const baseUrl = this.configService.get<string>('ALFA_GATEWAY_BASE_URL');
-    const userName = this.configService.get<string>('ALFA_GATEWAY_USERNAME');
-    const password = this.configService.get<string>('ALFA_GATEWAY_PASSWORD');
+    const requestBody = {
+      ...payload,
+      Token: this.createTBankToken(payload),
+    };
 
-    if (!baseUrl || !userName || !password) {
-      throw new BadGatewayException('Alfa payment gateway is not configured');
-    }
-
-    const formData = new URLSearchParams();
-    formData.set('userName', userName);
-    formData.set('password', password);
-
-    for (const [key, value] of Object.entries(params)) {
-      if (value !== undefined) {
-        formData.set(key, value);
-      }
-    }
-
-    const response = await fetch(`${baseUrl.replace(/\/$/, '')}/${method}`, {
+    const response = await fetch(`${this.resolveTBankApiUrl()}/${method}`, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Type': 'application/json',
       },
-      body: formData,
+      body: JSON.stringify(requestBody),
     });
 
     if (!response.ok) {
       throw new BadGatewayException(
-        `Alfa payment gateway request failed with status ${response.status}`,
+        `T-Bank gateway request failed with status ${response.status}`,
       );
     }
 
     return (await response.json()) as T;
   }
 
-  private resolveSessionTimeoutSecs() {
-    const rawValue = this.configService.get<string>(
-      'PAYMENT_SESSION_TIMEOUT_SECS',
-    );
+  private resolveTBankApiUrl() {
+    return (
+      this.configService.get<string>('TBANK_API_URL') ?? DEFAULT_TBANK_API_URL
+    ).replace(/\/$/, '');
+  }
+
+  private createTBankToken(payload: Record<string, unknown>) {
+    const password = this.getRequiredConfig('TBANK_PASSWORD');
+    const scalarPairs = Object.entries({
+      ...payload,
+      Password: password,
+    })
+      .filter(([key, value]) =>
+        key !== 'Token' &&
+        value !== undefined &&
+        value !== null &&
+        !Array.isArray(value) &&
+        typeof value !== 'object',
+      )
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([, value]) => String(value));
+
+    return createHash('sha256')
+      .update(scalarPairs.join(''), 'utf8')
+      .digest('hex');
+  }
+
+  private isValidTBankToken(payload: TBankNotification) {
+    const actualToken = typeof payload.Token === 'string' ? payload.Token : null;
+
+    if (!actualToken) {
+      return false;
+    }
+
+    const expectedToken = this.createTBankToken(payload);
+    return expectedToken === actualToken;
+  }
+
+  private getRequiredConfig(key: string) {
+    const value = this.configService.get<string>(key);
+
+    if (!value) {
+      throw new BadGatewayException(`${key} is not configured`);
+    }
+
+    return value;
+  }
+
+  private resolvePaymentTtlMinutes() {
+    const rawValue = this.configService.get<string>('TBANK_PAYMENT_TTL_MINUTES');
     const parsed = rawValue ? Number(rawValue) : NaN;
 
     if (Number.isFinite(parsed) && parsed > 0) {
       return parsed;
     }
 
-    return DEFAULT_SESSION_TIMEOUT_SECS;
+    return DEFAULT_PAYMENT_TTL_MINUTES;
   }
 
   private buildResultUrl(paymentId: string, result: 'success' | 'fail') {
     const configuredUrl =
       result === 'success'
-        ? this.configService.get<string>('PAYMENT_RETURN_URL')
-        : this.configService.get<string>('PAYMENT_FAIL_URL');
+        ? this.configService.get<string>('TBANK_SUCCESS_URL')
+        : this.configService.get<string>('TBANK_FAIL_URL');
 
     const baseUrl =
       configuredUrl ??
@@ -668,6 +1032,89 @@ export class PaymentsService {
     url.searchParams.set('result', result);
 
     return url.toString();
+  }
+
+  private async applyGatewaySnapshot(
+    payment: PaymentRecord,
+    gatewayResponse: Record<string, unknown>,
+    options: {
+      markRedirected: boolean;
+      refundedAmount?: number;
+    },
+  ) {
+    const nextState = resolvePaymentState(gatewayResponse, payment, options);
+
+    const updated = await this.prisma.paymentOrder.update({
+      where: { id: payment.id },
+      data: {
+        status: nextState.status,
+        gatewayStatus: nextState.gatewayStatus,
+        gatewayPaymentState: nextState.gatewayStatus,
+        gatewayErrorCode: nextState.gatewayErrorCode,
+        gatewayMessage: nextState.gatewayMessage,
+        gatewayDetails: nextState.gatewayDetails,
+        actionCodeDescription: nextState.gatewayMessage ?? nextState.gatewayDetails,
+        formUrl: nextState.paymentUrl ?? payment.formUrl,
+        paymentUrl: nextState.paymentUrl ?? payment.paymentUrl,
+        redirectedAt:
+          options.markRedirected && !payment.redirectedAt
+            ? new Date()
+            : payment.redirectedAt,
+        paidAt: nextState.paidAt ?? payment.paidAt,
+        failedAt: nextState.failedAt ?? payment.failedAt,
+        refundedAt: nextState.refundedAt ?? payment.refundedAt,
+        refundedAmount:
+          nextState.refundedAmount ?? payment.refundedAmount ?? 0,
+      },
+      select: paymentSelect,
+    });
+
+    await this.appendEvent(updated.id, 'STATUS_SYNC', {
+      gatewayStatus: updated.gatewayStatus,
+      success: true,
+      payload: {
+        status: updated.status,
+        refundedAmount: updated.refundedAmount,
+      },
+    });
+
+    return updated;
+  }
+
+  private async appendEvent(
+    paymentOrderId: string,
+    type:
+      | 'INIT_REQUEST'
+      | 'INIT_RESPONSE'
+      | 'GET_STATE_REQUEST'
+      | 'GET_STATE_RESPONSE'
+      | 'WEBHOOK_RECEIVED'
+      | 'WEBHOOK_REJECTED'
+      | 'REFUND_REQUEST'
+      | 'REFUND_RESPONSE'
+      | 'STATUS_SYNC',
+    input: {
+      gatewayStatus?: string | null;
+      success?: boolean | null;
+      errorCode?: string | null;
+      message?: string | null;
+      payload?: unknown;
+    },
+  ) {
+    await this.prisma.paymentOrderEvent.create({
+      data: {
+        paymentOrderId,
+        type,
+        gatewayStatus: input.gatewayStatus ?? null,
+        success: input.success ?? null,
+        errorCode: input.errorCode ?? null,
+        message: input.message ?? null,
+        payload:
+          input.payload === undefined
+            ? Prisma.JsonNull
+            : (input.payload as Prisma.InputJsonValue),
+      },
+    });
   }
 
   private mapPaymentStatus(payment: PaymentRecord) {
@@ -690,11 +1137,19 @@ export class PaymentsService {
       updatedAt: payment.updatedAt.toISOString(),
       paidAt: payment.paidAt?.toISOString() ?? null,
       failedAt: payment.failedAt?.toISOString() ?? null,
-      formUrl: payment.formUrl,
+      formUrl: payment.paymentUrl ?? payment.formUrl,
       actionCode: payment.actionCode,
-      actionCodeDescription: payment.actionCodeDescription,
+      actionCodeDescription:
+        payment.actionCodeDescription ??
+        payment.gatewayMessage ??
+        payment.gatewayDetails,
       membershipId: payment.membershipId,
       membershipIssuedAt: payment.membershipIssuedAt?.toISOString() ?? null,
+      gatewayStatus: payment.gatewayStatus,
+      gatewayProvider: payment.gatewayProvider,
+      gatewayPaymentId: payment.gatewayPaymentId,
+      refundedAmount: kopecksToRubles(payment.refundedAmount),
+      refundedAt: payment.refundedAt?.toISOString() ?? null,
       canRetry:
         payment.status === PaymentOrderStatus.FAILED ||
         payment.status === PaymentOrderStatus.EXPIRED,
@@ -702,7 +1157,8 @@ export class PaymentsService {
         payment.status === PaymentOrderStatus.PAID ||
         payment.status === PaymentOrderStatus.FAILED ||
         payment.status === PaymentOrderStatus.EXPIRED ||
-        payment.status === PaymentOrderStatus.CANCELLED,
+        payment.status === PaymentOrderStatus.CANCELLED ||
+        payment.status === PaymentOrderStatus.REFUNDED,
     };
   }
 }
@@ -757,7 +1213,6 @@ function startOfDay(value: Date) {
 function startOfWeek(value: Date) {
   const day = value.getDay();
   const diff = day === 0 ? -6 : 1 - day;
-
   return startOfDay(addDays(value, diff));
 }
 
@@ -765,6 +1220,10 @@ function addDays(value: Date, days: number) {
   const next = new Date(value);
   next.setDate(next.getDate() + days);
   return next;
+}
+
+function addMinutes(value: Date, minutes: number) {
+  return new Date(value.getTime() + minutes * 60 * 1000);
 }
 
 function summarizePayments(payments: PaymentRecord[], createdOrdersCount: number) {
@@ -852,10 +1311,7 @@ function summarizeWeek(payments: PaymentRecord[]) {
   };
 }
 
-function buildTopPlans(
-  payments: PaymentRecord[],
-  mode: 'revenue' | 'count',
-) {
+function buildTopPlans(payments: PaymentRecord[], mode: 'revenue' | 'count') {
   const buckets = new Map<
     string,
     {
@@ -916,7 +1372,7 @@ function decodeLedgerCursor(cursor?: string) {
       Buffer.from(cursor, 'base64url').toString('utf8'),
     ) as AdminLedgerCursor;
 
-    if (!parsed.paidAt || !parsed.id) {
+    if (!parsed.createdAt || !parsed.id) {
       return null;
     }
 
@@ -943,137 +1399,160 @@ function buildMerchantOrderNumber() {
 }
 
 function sanitizeDescription(value: string) {
-  return value.replace(/[%+\r\n]/g, ' ').slice(0, 99);
+  return value.replace(/[%+\r\n]/g, ' ').slice(0, 140);
 }
 
-function normalizeNumeric(value: string | number | undefined) {
-  return Number(value ?? 0);
+function sanitizeReceiptItemName(value: string) {
+  return value.replace(/[\r\n]/g, ' ').slice(0, 128);
 }
 
-function normalizeNullableNumber(value: string | number | undefined) {
+function toOptionalString(value: unknown) {
   if (value === undefined || value === null || value === '') {
     return null;
   }
 
-  const parsed = Number(value);
-
-  return Number.isFinite(parsed) ? parsed : null;
+  return String(value);
 }
 
 function resolvePaymentState(
-  statusResponse: AlfaStatusResponse,
+  response: Record<string, unknown>,
   payment: PaymentRecord,
+  options: { refundedAmount?: number },
 ) {
-  const errorCode = normalizeNumeric(statusResponse.errorCode);
-  const orderStatus =
-    statusResponse.orderStatus ?? payment.gatewayOrderStatus ?? null;
-  const paymentAmounts = normalizeGatewayAmounts(statusResponse.paymentAmountInfo);
-  const paymentState = paymentAmounts.paymentState;
-  const actionCode = normalizeNullableNumber(statusResponse.actionCode);
-  const actionCodeDescription =
-    statusResponse.actionCodeDescription ??
-    statusResponse.errorMessage ??
-    payment.actionCodeDescription ??
-    null;
+  const gatewayStatus = toOptionalString(response.Status) ?? payment.gatewayStatus;
+  const gatewayErrorCode =
+    toOptionalString(response.ErrorCode) ?? payment.gatewayErrorCode;
+  const gatewayMessage =
+    toOptionalString(response.Message) ?? payment.gatewayMessage;
+  const gatewayDetails =
+    toOptionalString(response.Details) ?? payment.gatewayDetails;
+  const paymentUrl =
+    toOptionalString(response.PaymentURL) ??
+    payment.paymentUrl ??
+    payment.formUrl;
 
-  if (
-    errorCode === 0 &&
-    (orderStatus === 2 ||
-      paymentState === 'DEPOSITED' ||
-      (paymentAmounts.depositedAmountKopecks !== null &&
-        paymentAmounts.depositedAmountKopecks >= payment.amount))
-  ) {
-    return {
-      status: PaymentOrderStatus.PAID,
-      gatewayOrderStatus: orderStatus,
-      gatewayPaymentState: paymentState,
-      actionCode,
-      actionCodeDescription,
-      paidAt: new Date(),
-      failedAt: null,
-    };
+  switch (gatewayStatus) {
+    case 'CONFIRMED':
+      return {
+        status: PaymentOrderStatus.PAID,
+        gatewayStatus,
+        gatewayErrorCode,
+        gatewayMessage,
+        gatewayDetails,
+        paymentUrl,
+        paidAt: payment.paidAt ?? new Date(),
+        failedAt: null,
+        refundedAt: null,
+        refundedAmount: payment.refundedAmount,
+      };
+    case 'AUTHORIZED':
+    case 'NEW':
+    case '3DS_CHECKING':
+      return {
+        status:
+          payment.status === PaymentOrderStatus.REDIRECT_READY ||
+          payment.status === PaymentOrderStatus.FORM_REGISTERED
+            ? PaymentOrderStatus.REDIRECTED
+            : PaymentOrderStatus.PROCESSING,
+        gatewayStatus,
+        gatewayErrorCode,
+        gatewayMessage,
+        gatewayDetails,
+        paymentUrl,
+        paidAt: payment.paidAt,
+        failedAt: payment.failedAt,
+        refundedAt: payment.refundedAt,
+        refundedAmount: payment.refundedAmount,
+      };
+    case 'REFUNDED':
+    case 'REVERSED':
+      return {
+        status: PaymentOrderStatus.REFUNDED,
+        gatewayStatus,
+        gatewayErrorCode,
+        gatewayMessage,
+        gatewayDetails,
+        paymentUrl,
+        paidAt: payment.paidAt,
+        failedAt: payment.failedAt,
+        refundedAt: payment.refundedAt ?? new Date(),
+        refundedAmount: options.refundedAmount ?? payment.amount,
+      };
+    case 'CANCELED':
+      return {
+        status: PaymentOrderStatus.CANCELLED,
+        gatewayStatus,
+        gatewayErrorCode,
+        gatewayMessage,
+        gatewayDetails,
+        paymentUrl,
+        paidAt: payment.paidAt,
+        failedAt: payment.failedAt ?? new Date(),
+        refundedAt: payment.refundedAt,
+        refundedAmount: payment.refundedAmount,
+      };
+    case 'DEADLINE_EXPIRED':
+    case 'EXPIRED':
+      return {
+        status: PaymentOrderStatus.EXPIRED,
+        gatewayStatus,
+        gatewayErrorCode,
+        gatewayMessage,
+        gatewayDetails,
+        paymentUrl,
+        paidAt: payment.paidAt,
+        failedAt: payment.failedAt ?? new Date(),
+        refundedAt: payment.refundedAt,
+        refundedAmount: payment.refundedAmount,
+      };
+    case 'REJECTED':
+    case 'PROCESSING_ERROR':
+      return {
+        status: PaymentOrderStatus.FAILED,
+        gatewayStatus,
+        gatewayErrorCode,
+        gatewayMessage,
+        gatewayDetails,
+        paymentUrl,
+        paidAt: payment.paidAt,
+        failedAt: payment.failedAt ?? new Date(),
+        refundedAt: payment.refundedAt,
+        refundedAmount: payment.refundedAmount,
+      };
+    default:
+      return {
+        status: payment.status,
+        gatewayStatus,
+        gatewayErrorCode,
+        gatewayMessage,
+        gatewayDetails,
+        paymentUrl,
+        paidAt: payment.paidAt,
+        failedAt: payment.failedAt,
+        refundedAt: payment.refundedAt,
+        refundedAmount: payment.refundedAmount,
+      };
   }
-
-  if (isExpiredStatus(statusResponse)) {
-    return {
-      status: PaymentOrderStatus.EXPIRED,
-      gatewayOrderStatus: orderStatus,
-      gatewayPaymentState: paymentState,
-      actionCode,
-      actionCodeDescription,
-      paidAt: null,
-      failedAt: new Date(),
-    };
-  }
-
-  if (orderStatus === 6 || errorCode === 2) {
-    return {
-      status: PaymentOrderStatus.FAILED,
-      gatewayOrderStatus: orderStatus,
-      gatewayPaymentState: paymentState,
-      actionCode,
-      actionCodeDescription,
-      paidAt: null,
-      failedAt: new Date(),
-    };
-  }
-
-  if (orderStatus === 3 || orderStatus === 4) {
-    return {
-      status: PaymentOrderStatus.CANCELLED,
-      gatewayOrderStatus: orderStatus,
-      gatewayPaymentState: paymentState,
-      actionCode,
-      actionCodeDescription,
-      paidAt: null,
-      failedAt: new Date(),
-    };
-  }
-
-  return {
-    status:
-      payment.status === PaymentOrderStatus.CREATED ||
-      payment.status === PaymentOrderStatus.FORM_REGISTERED
-        ? PaymentOrderStatus.REDIRECTED
-        : payment.status,
-    gatewayOrderStatus: orderStatus,
-    gatewayPaymentState: paymentState,
-    actionCode,
-    actionCodeDescription,
-    paidAt: payment.paidAt,
-    failedAt: payment.failedAt,
-  };
-}
-
-function normalizeGatewayAmounts(
-  paymentAmountInfo: AlfaStatusResponse['paymentAmountInfo'] | undefined,
-) {
-  return {
-    paymentState: paymentAmountInfo?.paymentState ?? null,
-    approvedAmountKopecks: normalizeNullableNumber(
-      paymentAmountInfo?.approvedAmount,
-    ),
-    depositedAmountKopecks: normalizeNullableNumber(
-      paymentAmountInfo?.depositedAmount,
-    ),
-    refundedAmountKopecks: normalizeNullableNumber(
-      paymentAmountInfo?.refundedAmount,
-    ),
-  };
-}
-
-function isExpiredStatus(statusResponse: AlfaStatusResponse) {
-  return statusResponse.actionCode === -2007 ||
-    statusResponse.actionCode === '-2007' ||
-    statusResponse.actionCodeDescription?.toLowerCase().includes('истек') ||
-    statusResponse.actionCodeDescription?.toLowerCase().includes('expired')
-    ? true
-    : false;
 }
 
 function shouldIssueMembership(payment: PaymentRecord) {
+  return payment.status === PaymentOrderStatus.PAID && !payment.membershipIssuedAt;
+}
+
+function canRefund(payment: PaymentRecord) {
   return (
-    payment.status === PaymentOrderStatus.PAID && !payment.membershipIssuedAt
+    payment.gatewayProvider === 'TBANK' &&
+    payment.status === PaymentOrderStatus.PAID &&
+    payment.refundedAmount < payment.amount
+  );
+}
+
+function resolveLedgerTimestamp(payment: PaymentRecord) {
+  return (
+    payment.refundedAt?.toISOString() ??
+    payment.paidAt?.toISOString() ??
+    payment.failedAt?.toISOString() ??
+    payment.createdAt.toISOString()
   );
 }
 
@@ -1084,6 +1563,12 @@ function getPaymentStatusMeta(status: PaymentOrderStatus) {
         label: 'Оплата прошла',
         tone: 'success',
         message: 'Абонемент активирован и уже доступен в вашем кабинете.',
+      };
+    case PaymentOrderStatus.REFUNDED:
+      return {
+        label: 'Платёж возвращён',
+        tone: 'muted',
+        message: 'Возврат выполнен. Абонемент при этом автоматически не отзывался.',
       };
     case PaymentOrderStatus.EXPIRED:
       return {
@@ -1105,35 +1590,20 @@ function getPaymentStatusMeta(status: PaymentOrderStatus) {
         tone: 'muted',
         message: 'Платёж был отменён и абонемент не был активирован.',
       };
+    case PaymentOrderStatus.PROCESSING:
     case PaymentOrderStatus.REDIRECTED:
       return {
         label: 'Ожидаем результат',
         tone: 'warning',
         message: 'Платёж обрабатывается. Обновляем данные у платёжного шлюза.',
       };
+    case PaymentOrderStatus.REDIRECT_READY:
     case PaymentOrderStatus.FORM_REGISTERED:
     case PaymentOrderStatus.CREATED:
       return {
         label: 'Платёж создан',
         tone: 'warning',
-        message: 'Переходим к оплате через банковский шлюз.',
+        message: 'Переходим к оплате через банковскую страницу.',
       };
   }
-}
-
-function mapGatewayRegistrationError(
-  errorCode: string | number | undefined,
-  errorMessage: string | undefined,
-) {
-  const normalizedMessage = (errorMessage ?? '').toLowerCase();
-
-  if (
-    normalizeNumeric(errorCode) === 5 &&
-    (normalizedMessage.includes('access denied') ||
-      normalizedMessage.includes('доступ запрещ'))
-  ) {
-    return 'Платёжный шлюз отклонил доступ. Проверьте API-логин, пароль и обязательно смените временный пароль Alfa.';
-  }
-
-  return errorMessage ?? 'Payment registration failed';
 }

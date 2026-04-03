@@ -1,4 +1,4 @@
-import { Controller, Get, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { UserRole } from '@prisma/client';
 import { AuthenticatedGuard } from '../common/auth/authenticated.guard';
 import { Roles } from '../common/auth/roles.decorator';
@@ -26,5 +26,15 @@ export class PaymentsAdminController {
       cursor,
       limit: limit ? Number(limit) : undefined,
     });
+  }
+
+  @Get(':paymentId')
+  getPayment(@Param('paymentId') paymentId: string) {
+    return this.paymentsService.getAdminPaymentDetails(paymentId);
+  }
+
+  @Post(':paymentId/refund')
+  refundPayment(@Param('paymentId') paymentId: string) {
+    return this.paymentsService.refundAdminPayment(paymentId);
   }
 }
