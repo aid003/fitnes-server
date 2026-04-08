@@ -12,6 +12,7 @@ describe('PaymentsService', () => {
   let membershipsService: {
     issueMembershipFromPayment: jest.Mock;
     attachQrSnapshotFromPayment: jest.Mock;
+    revokeMembershipAfterRefund: jest.Mock;
   };
 
   beforeEach(() => {
@@ -44,13 +45,26 @@ describe('PaymentsService', () => {
             return 'password';
           case 'TBANK_API_URL':
             return 'https://securepay.tinkoff.ru/v2';
+          case 'TBANK_REQUEST_TIMEOUT_MS':
+            return '10000';
           case 'TBANK_NOTIFICATION_URL':
             return 'https://api.example.test/payments/webhooks/tbank';
           case 'TBANK_SUCCESS_URL':
           case 'TBANK_FAIL_URL':
             return 'https://app.example.test/payments/result';
+          case 'TBANK_PAY_TYPE':
+            return 'O';
+          case 'TBANK_LANGUAGE':
+            return 'ru';
+          case 'TBANK_RECEIPT_TAXATION':
           case 'TBANK_TAXATION':
             return 'osn';
+          case 'TBANK_RECEIPT_ITEM_TAX':
+            return 'none';
+          case 'TBANK_RECEIPT_PAYMENT_METHOD':
+            return 'advance';
+          case 'TBANK_RECEIPT_PAYMENT_OBJECT':
+            return 'payment';
           case 'FRONTEND_ORIGIN':
             return 'https://app.example.test';
           default:
@@ -62,6 +76,7 @@ describe('PaymentsService', () => {
     membershipsService = {
       issueMembershipFromPayment: jest.fn(),
       attachQrSnapshotFromPayment: jest.fn(),
+      revokeMembershipAfterRefund: jest.fn(),
     };
 
     paymentsService = new PaymentsService(
@@ -138,7 +153,19 @@ describe('PaymentsService', () => {
     const payload = JSON.parse(fetchInit.body as string);
     expect(payload.TerminalKey).toBe('TBankTest');
     expect(payload.Amount).toBe(849000);
+    expect(payload.SuccessURL).toContain('/payments/result?');
+    expect(payload.SuccessURL).toContain('paymentId=');
+    expect(payload.SuccessURL).toContain('result=success');
+    expect(payload.FailURL).toContain('/payments/result?');
+    expect(payload.FailURL).toContain('paymentId=');
+    expect(payload.FailURL).toContain('result=fail');
     expect(payload.PaymentURL).toBeUndefined();
+    expect(payload.PayType).toBe('O');
+    expect(payload.Language).toBe('ru');
+    expect(payload.Receipt.Taxation).toBe('osn');
+    expect(payload.Receipt.Items[0].Tax).toBe('none');
+    expect(payload.Receipt.Items[0].PaymentMethod).toBe('advance');
+    expect(payload.Receipt.Items[0].PaymentObject).toBe('payment');
     expect(payload.Token).toHaveLength(64);
   });
 
@@ -236,6 +263,7 @@ describe('PaymentsService', () => {
         userId: 'user-1',
         gatewayProvider: 'TBANK',
         gatewayPaymentId: '700001',
+        membershipId: 'membership-1',
         status: PaymentOrderStatus.PAID,
         gatewayStatus: 'CONFIRMED',
         paidAt: new Date('2026-04-03T10:00:00.000Z'),
@@ -247,6 +275,7 @@ describe('PaymentsService', () => {
         userId: 'user-1',
         gatewayProvider: 'TBANK',
         gatewayPaymentId: '700001',
+        membershipId: 'membership-1',
         status: PaymentOrderStatus.REFUNDED,
         gatewayStatus: 'REFUNDED',
         refundedAmount: 849000,
@@ -259,6 +288,7 @@ describe('PaymentsService', () => {
         userId: 'user-1',
         gatewayProvider: 'TBANK',
         gatewayPaymentId: '700001',
+        membershipId: 'membership-1',
         status: PaymentOrderStatus.PAID,
         gatewayStatus: 'CONFIRMED',
         paidAt: new Date('2026-04-03T10:00:00.000Z'),
@@ -270,6 +300,7 @@ describe('PaymentsService', () => {
         userId: 'user-1',
         gatewayProvider: 'TBANK',
         gatewayPaymentId: '700001',
+        membershipId: 'membership-1',
         status: PaymentOrderStatus.REFUNDED,
         gatewayStatus: 'REFUNDED',
         refundedAmount: 849000,
@@ -290,12 +321,76 @@ describe('PaymentsService', () => {
     const result = await paymentsService.refundAdminPayment('payment-1');
 
     expect(result.status).toBe(PaymentOrderStatus.REFUNDED);
+    expect(membershipsService.revokeMembershipAfterRefund).toHaveBeenCalledWith(
+      'membership-1',
+    );
     expect(prismaService.paymentOrderEvent.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
           type: 'REFUND_REQUEST',
         }),
       }),
+    );
+  });
+
+  it('revokes membership when webhook reports refunded payment', async () => {
+    const notification = {
+      PaymentId: '700001',
+      Status: 'REFUNDED',
+      Success: true,
+      ErrorCode: '0',
+      Amount: 849000,
+      OrderId: 'fit-1',
+      TerminalKey: 'TBankTest',
+    } as Record<string, unknown>;
+    notification.Token = (paymentsService as any).createTBankToken(notification);
+
+    prismaService.paymentOrder.findFirst.mockResolvedValue(
+      createPaymentRecord({
+        id: 'payment-1',
+        userId: 'user-1',
+        gatewayProvider: 'TBANK',
+        gatewayPaymentId: '700001',
+        membershipId: 'membership-1',
+        status: PaymentOrderStatus.PAID,
+        gatewayStatus: 'CONFIRMED',
+        paidAt: new Date('2026-04-03T10:00:00.000Z'),
+      }),
+    );
+    prismaService.paymentOrder.update
+      .mockResolvedValueOnce(
+        createPaymentRecord({
+          id: 'payment-1',
+          userId: 'user-1',
+          gatewayProvider: 'TBANK',
+          gatewayPaymentId: '700001',
+          membershipId: 'membership-1',
+          status: PaymentOrderStatus.PAID,
+          gatewayStatus: 'CONFIRMED',
+          paidAt: new Date('2026-04-03T10:00:00.000Z'),
+        }),
+      )
+      .mockResolvedValueOnce(
+        createPaymentRecord({
+          id: 'payment-1',
+          userId: 'user-1',
+          gatewayProvider: 'TBANK',
+          gatewayPaymentId: '700001',
+          membershipId: 'membership-1',
+          status: PaymentOrderStatus.REFUNDED,
+          gatewayStatus: 'REFUNDED',
+          refundedAmount: 849000,
+          refundedAt: new Date('2026-04-03T11:00:00.000Z'),
+        }),
+      );
+
+    const response = await paymentsService.handleTBankWebhook(
+      notification as never,
+    );
+
+    expect(response).toBe('OK');
+    expect(membershipsService.revokeMembershipAfterRefund).toHaveBeenCalledWith(
+      'membership-1',
     );
   });
 
@@ -337,6 +432,95 @@ describe('PaymentsService', () => {
     await expect(
       paymentsService.createPassPayment('user-1', 'plan-1'),
     ).rejects.toBeInstanceOf(BadGatewayException);
+  });
+
+  it('sends RedirectDueDate in T-Bank datetime format', async () => {
+    prismaService.user.findUnique.mockResolvedValue({
+      id: 'user-1',
+      email: 'user@example.com',
+      name: 'User',
+    });
+    prismaService.passPlan.findFirst.mockResolvedValue({
+      id: 'plan-1',
+      title: '1 месяц',
+      subtitle: 'Безлимит',
+      description: null,
+      price: 849000,
+      currency: 'RUB',
+      billingType: 'FIXED_TERM',
+      durationValue: 1,
+      durationUnit: 'MONTH',
+      group: {
+        title: 'Group',
+        variant: {
+          title: 'Variant',
+          category: {
+            title: 'Category',
+          },
+        },
+      },
+    });
+    prismaService.paymentOrder.create.mockImplementation(
+      async ({ data }: { data: Record<string, unknown> }) => ({
+        ...createPaymentRecord(),
+        ...data,
+      }),
+    );
+    prismaService.paymentOrder.update.mockResolvedValue(createPaymentRecord());
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        Success: true,
+        ErrorCode: '0',
+        Status: 'NEW',
+        PaymentId: '700001',
+        PaymentURL: 'https://pay.tbank.ru/new/test',
+      }),
+    });
+
+    await paymentsService.createPassPayment('user-1', 'plan-1');
+
+    const [, fetchInit] = (global.fetch as jest.Mock).mock.calls[0];
+    const payload = JSON.parse(fetchInit.body as string);
+    expect(payload.RedirectDueDate).toMatch(
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/,
+    );
+  });
+
+  it('fails fast when init payload has invalid amount and receipt total mismatch', () => {
+    expect(() =>
+      (paymentsService as any).validateInitPayload({
+        TerminalKey: 'TBankTest',
+        Amount: 10,
+        OrderId: 'fit-1',
+        Description: 'Оплата',
+        PayType: 'O',
+        Language: 'ru',
+        NotificationURL: 'https://api.example.test/payments/webhooks/tbank',
+        SuccessURL: 'https://app.example.test/payments/result',
+        FailURL: 'https://app.example.test/payments/result',
+        RedirectDueDate: '2026-04-07T12:00:00+03:00',
+        DATA: {
+          paymentId: 'payment-1',
+        },
+        Receipt: {
+          Email: 'user@example.com',
+          Taxation: 'osn',
+          Items: [
+            {
+              Name: 'Абонемент',
+              Amount: 9,
+            },
+          ],
+        },
+      }),
+    ).toThrow(BadGatewayException);
+  });
+
+  it('uses configured request timeout and validates pay type/language', () => {
+    expect((paymentsService as any).resolveTBankRequestTimeoutMs()).toBe(10000);
+    expect((paymentsService as any).resolveTBankPayType()).toBe('O');
+    expect((paymentsService as any).resolveTBankLanguage()).toBe('ru');
   });
 });
 

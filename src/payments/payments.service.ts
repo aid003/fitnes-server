@@ -17,9 +17,14 @@ import { MembershipsService } from '../memberships/memberships.service';
 import { PrismaService } from '../prisma/prisma.service';
 
 const DEFAULT_PAYMENT_TTL_MINUTES = 60;
+const DEFAULT_TBANK_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_TBANK_API_URL = 'https://securepay.tinkoff.ru/v2';
 const DEFAULT_RECEIPT_TAXATION = 'osn';
 const DEFAULT_RECEIPT_TAX = 'none';
+const DEFAULT_TBANK_PAY_TYPE = 'O';
+const DEFAULT_TBANK_LANGUAGE = 'ru';
+const DEFAULT_RECEIPT_PAYMENT_METHOD = 'full_payment';
+const DEFAULT_RECEIPT_PAYMENT_OBJECT = 'service';
 
 const paymentSelect = {
   id: true,
@@ -248,6 +253,8 @@ export class PaymentsService {
     const returnUrl = this.buildResultUrl(paymentId, 'success');
     const failUrl = this.buildResultUrl(paymentId, 'fail');
     const expiresAt = addMinutes(new Date(), this.resolvePaymentTtlMinutes());
+    this.validateTBankConfiguration();
+
     const receiptPayload = this.buildReceiptPayload({
       user,
       passPlan,
@@ -288,6 +295,7 @@ export class PaymentsService {
 
     try {
       initResponse = await this.initGatewayPayment(created, expiresAt);
+      this.logger.warn({ initResponse }, 'TBank Init response');
     } catch (error) {
       await this.prisma.paymentOrder.update({
         where: { id: created.id },
@@ -697,6 +705,12 @@ export class PaymentsService {
     }
 
     if (payment.status === PaymentOrderStatus.REFUNDED) {
+      if (payment.membershipId) {
+        await this.membershipsService.revokeMembershipAfterRefund(
+          payment.membershipId,
+        );
+      }
+
       return this.getAdminPaymentDetails(payment.id);
     }
 
@@ -747,7 +761,9 @@ export class PaymentsService {
       refundedAmount: payment.amount,
     });
 
-    return this.getAdminPaymentDetails(updated.id);
+    const finalPayment = await this.issueMembershipIfNeeded(updated);
+
+    return this.getAdminPaymentDetails(finalPayment.id);
   }
 
   private async syncPaymentStatus(payment: PaymentRecord) {
@@ -785,6 +801,16 @@ export class PaymentsService {
   }
 
   private async issueMembershipIfNeeded(payment: PaymentRecord) {
+    if (
+      payment.status === PaymentOrderStatus.REFUNDED &&
+      payment.membershipId
+    ) {
+      await this.membershipsService.revokeMembershipAfterRefund(
+        payment.membershipId,
+      );
+      return payment;
+    }
+
     if (!shouldIssueMembership(payment)) {
       if (payment.status === PaymentOrderStatus.PAID && payment.membershipId) {
         await this.attachQrSnapshotSafely(payment.membershipId, payment.id);
@@ -872,6 +898,7 @@ export class PaymentsService {
     return {
       Email: receiptEmail,
       Taxation:
+        this.configService.get<string>('TBANK_RECEIPT_TAXATION') ??
         this.configService.get<string>('TBANK_TAXATION') ??
         DEFAULT_RECEIPT_TAXATION,
       Items: [
@@ -880,26 +907,33 @@ export class PaymentsService {
           Price: input.passPlan.price,
           Quantity: 1,
           Amount: input.passPlan.price,
-          Tax: DEFAULT_RECEIPT_TAX,
-          PaymentMethod: 'full_payment',
-          PaymentObject: 'service',
+          Tax:
+            this.configService.get<string>('TBANK_RECEIPT_ITEM_TAX') ??
+            DEFAULT_RECEIPT_TAX,
+          PaymentMethod:
+            this.configService.get<string>('TBANK_RECEIPT_PAYMENT_METHOD') ??
+            DEFAULT_RECEIPT_PAYMENT_METHOD,
+          PaymentObject:
+            this.configService.get<string>('TBANK_RECEIPT_PAYMENT_OBJECT') ??
+            DEFAULT_RECEIPT_PAYMENT_OBJECT,
         },
       ],
     };
   }
 
   private buildInitPayload(payment: PaymentRecord, expiresAt: Date) {
-    return {
+    const payload = {
       TerminalKey: this.getRequiredConfig('TBANK_TERMINAL_KEY'),
       Amount: payment.amount,
       OrderId: payment.merchantOrderNumber,
       Description: sanitizeDescription(payment.planTitle),
+      PayType: this.resolveTBankPayType(),
+      Language: this.resolveTBankLanguage(),
       NotificationURL: this.getRequiredConfig('TBANK_NOTIFICATION_URL'),
-      SuccessURL:
-        this.configService.get<string>('TBANK_SUCCESS_URL') ?? payment.returnUrl,
-      FailURL:
-        this.configService.get<string>('TBANK_FAIL_URL') ?? payment.failUrl,
-      RedirectDueDate: expiresAt.toISOString(),
+      // Keep redirect URLs that were already built with paymentId/result.
+      SuccessURL: payment.returnUrl,
+      FailURL: payment.failUrl,
+      RedirectDueDate: formatTBankDateTime(expiresAt),
       DATA: {
         paymentId: payment.id,
         userId: payment.userId,
@@ -908,6 +942,10 @@ export class PaymentsService {
       },
       Receipt: payment.receiptPayload ?? undefined,
     };
+
+    this.validateInitPayload(payload);
+
+    return payload;
   }
 
   private async initGatewayPayment(payment: PaymentRecord, expiresAt: Date) {
@@ -936,18 +974,64 @@ export class PaymentsService {
     method: string,
     payload: Record<string, unknown>,
   ) {
+    const requestId = randomUUID();
+    const endpoint = `${this.resolveTBankApiUrl()}/${method}`;
+    const controller = new AbortController();
+    const timeoutMs = this.resolveTBankRequestTimeoutMs();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     const requestBody = {
       ...payload,
       Token: this.createTBankToken(payload),
     };
 
-    const response = await fetch(`${this.resolveTBankApiUrl()}/${method}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
+    this.logger.log(
+      {
+        requestId,
+        method,
+        endpoint,
+        payload: sanitizePayloadForLogs(payload),
       },
-      body: JSON.stringify(requestBody),
-    });
+      'T-Bank request',
+    );
+
+    let response: Response;
+
+    try {
+      response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        (error.name === 'AbortError' || controller.signal.aborted)
+      ) {
+        throw new BadGatewayException(
+          `T-Bank gateway request timed out after ${timeoutMs}ms`,
+        );
+      }
+
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    const parsed = await parseGatewayResponse(response);
+
+    this.logger.log(
+      {
+        requestId,
+        method,
+        endpoint,
+        httpStatus: response.status,
+        response: sanitizePayloadForLogs(parsed),
+      },
+      'T-Bank response',
+    );
 
     if (!response.ok) {
       throw new BadGatewayException(
@@ -955,13 +1039,50 @@ export class PaymentsService {
       );
     }
 
-    return (await response.json()) as T;
+    if (!parsed || typeof parsed !== 'object') {
+      throw new BadGatewayException('T-Bank gateway returned invalid JSON');
+    }
+
+    return parsed as T;
   }
 
   private resolveTBankApiUrl() {
     return (
       this.configService.get<string>('TBANK_API_URL') ?? DEFAULT_TBANK_API_URL
     ).replace(/\/$/, '');
+  }
+
+  private resolveTBankRequestTimeoutMs() {
+    const rawValue = this.configService.get<string>('TBANK_REQUEST_TIMEOUT_MS');
+    const parsed = rawValue ? Number(rawValue) : NaN;
+
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.trunc(parsed);
+    }
+
+    return DEFAULT_TBANK_REQUEST_TIMEOUT_MS;
+  }
+
+  private resolveTBankPayType() {
+    const payType =
+      this.configService.get<string>('TBANK_PAY_TYPE') ?? DEFAULT_TBANK_PAY_TYPE;
+
+    if (payType !== 'O' && payType !== 'T') {
+      throw new BadGatewayException('TBANK_PAY_TYPE must be O or T');
+    }
+
+    return payType;
+  }
+
+  private resolveTBankLanguage() {
+    const language =
+      this.configService.get<string>('TBANK_LANGUAGE') ?? DEFAULT_TBANK_LANGUAGE;
+
+    if (language !== 'ru' && language !== 'en') {
+      throw new BadGatewayException('TBANK_LANGUAGE must be ru or en');
+    }
+
+    return language;
   }
 
   private createTBankToken(payload: Record<string, unknown>) {
@@ -1004,6 +1125,181 @@ export class PaymentsService {
     }
 
     return value;
+  }
+
+  private validateTBankConfiguration() {
+    const terminalKey = this.getRequiredConfig('TBANK_TERMINAL_KEY');
+    const password = this.getRequiredConfig('TBANK_PASSWORD');
+    const notificationUrl = this.getRequiredConfig('TBANK_NOTIFICATION_URL');
+
+    if (terminalKey.length > 20) {
+      throw new BadGatewayException(
+        'TBANK_TERMINAL_KEY length must be less than or equal to 20',
+      );
+    }
+
+    if (!password.trim()) {
+      throw new BadGatewayException('TBANK_PASSWORD must not be empty');
+    }
+
+    assertValidUrl(notificationUrl, 'TBANK_NOTIFICATION_URL');
+
+    if (
+      this.configService.get<string>('NODE_ENV') === 'production' &&
+      /demo|test/i.test(terminalKey)
+    ) {
+      this.logger.warn(
+        { terminalKeyPreview: `${terminalKey.slice(0, 8)}...` },
+        'T-Bank demo/test terminal key is used in production environment',
+      );
+    }
+  }
+
+  private validateInitPayload(payload: Record<string, unknown>) {
+    const terminalKey = asRequiredString(payload.TerminalKey, 'TerminalKey');
+    if (terminalKey.length > 20) {
+      throw new BadGatewayException('TerminalKey length must be <= 20');
+    }
+
+    const orderId = asRequiredString(payload.OrderId, 'OrderId');
+    if (orderId.length > 36) {
+      throw new BadGatewayException('OrderId length must be <= 36');
+    }
+
+    const amount = asRequiredPositiveInt(payload.Amount, 'Amount');
+    if (String(amount).length > 10) {
+      throw new BadGatewayException('Amount length must be <= 10');
+    }
+
+    const description = asRequiredString(payload.Description, 'Description');
+    if (description.length > 140) {
+      throw new BadGatewayException('Description length must be <= 140');
+    }
+
+    const payType = asRequiredString(payload.PayType, 'PayType');
+    if (payType !== 'O' && payType !== 'T') {
+      throw new BadGatewayException('PayType must be O or T');
+    }
+
+    const language = asRequiredString(payload.Language, 'Language');
+    if (language !== 'ru' && language !== 'en') {
+      throw new BadGatewayException('Language must be ru or en');
+    }
+
+    const notificationUrl = asRequiredString(
+      payload.NotificationURL,
+      'NotificationURL',
+    );
+    assertValidUrl(notificationUrl, 'NotificationURL');
+
+    const successUrl = payload.SuccessURL;
+    if (typeof successUrl === 'string' && successUrl.length > 0) {
+      assertValidUrl(successUrl, 'SuccessURL');
+    }
+
+    const failUrl = payload.FailURL;
+    if (typeof failUrl === 'string' && failUrl.length > 0) {
+      assertValidUrl(failUrl, 'FailURL');
+    }
+
+    const redirectDueDate = asRequiredString(
+      payload.RedirectDueDate,
+      'RedirectDueDate',
+    );
+    if (!isValidTBankDateTime(redirectDueDate)) {
+      throw new BadGatewayException(
+        'RedirectDueDate must match YYYY-MM-DDTHH:mm:ss+HH:MM',
+      );
+    }
+
+    this.validateDataPayload(payload.DATA);
+    this.validateReceiptPayload(payload.Receipt, amount);
+  }
+
+  private validateDataPayload(data: unknown) {
+    if (data === undefined || data === null) {
+      return;
+    }
+
+    if (typeof data !== 'object' || Array.isArray(data)) {
+      throw new BadGatewayException('DATA must be an object');
+    }
+
+    const entries = Object.entries(data as Record<string, unknown>);
+    if (entries.length > 20) {
+      throw new BadGatewayException('DATA must contain at most 20 entries');
+    }
+
+    for (const [key, value] of entries) {
+      if (key.length > 20) {
+        throw new BadGatewayException('DATA key length must be <= 20');
+      }
+
+      const scalarValue =
+        value === undefined || value === null ? '' : String(value);
+      if (scalarValue.length > 100) {
+        throw new BadGatewayException('DATA value length must be <= 100');
+      }
+    }
+  }
+
+  private validateReceiptPayload(receipt: unknown, amount: number) {
+    if (receipt === undefined || receipt === null) {
+      return;
+    }
+
+    if (typeof receipt !== 'object' || Array.isArray(receipt)) {
+      throw new BadGatewayException('Receipt must be an object');
+    }
+
+    const receiptRecord = receipt as Record<string, unknown>;
+    const email = receiptRecord.Email;
+    const phone = receiptRecord.Phone;
+    if (
+      (typeof email !== 'string' || email.length === 0) &&
+      (typeof phone !== 'string' || phone.length === 0)
+    ) {
+      throw new BadGatewayException(
+        'Receipt must contain Email or Phone for fiscalization',
+      );
+    }
+
+    const taxation = receiptRecord.Taxation;
+    if (typeof taxation !== 'string' || taxation.length === 0) {
+      throw new BadGatewayException('Receipt.Taxation is required');
+    }
+
+    const items = receiptRecord.Items;
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new BadGatewayException('Receipt.Items must be a non-empty array');
+    }
+
+    if (items.length > 100) {
+      throw new BadGatewayException('Receipt.Items must contain at most 100 rows');
+    }
+
+    const itemsAmount = items.reduce((sum, rawItem) => {
+      if (typeof rawItem !== 'object' || !rawItem || Array.isArray(rawItem)) {
+        throw new BadGatewayException('Receipt.Items must contain objects');
+      }
+
+      const item = rawItem as Record<string, unknown>;
+      const itemName = asRequiredString(item.Name, 'Receipt.Items[].Name');
+      if (itemName.length > 128) {
+        throw new BadGatewayException(
+          'Receipt.Items[].Name length must be <= 128',
+        );
+      }
+
+      const itemAmount = asRequiredPositiveInt(item.Amount, 'Receipt.Items[].Amount');
+      return sum + itemAmount;
+    }, 0);
+
+    if (itemsAmount !== amount) {
+      throw new BadGatewayException(
+        'Amount must equal sum of Receipt.Items[].Amount',
+      );
+    }
   }
 
   private resolvePaymentTtlMinutes() {
@@ -1078,7 +1374,20 @@ export class PaymentsService {
       },
     });
 
+    await this.syncMembershipStateAfterPaymentUpdate(updated);
+
     return updated;
+  }
+
+  private async syncMembershipStateAfterPaymentUpdate(payment: PaymentRecord) {
+    if (
+      payment.status === PaymentOrderStatus.REFUNDED &&
+      payment.membershipId
+    ) {
+      await this.membershipsService.revokeMembershipAfterRefund(
+        payment.membershipId,
+      );
+    }
   }
 
   private async appendEvent(
@@ -1173,6 +1482,118 @@ function resolveAdminPaymentsRange(rangeKey?: string): AdminPaymentsRange {
     days: 30,
     label: 'Последние 30 дней',
   };
+}
+
+function asRequiredString(value: unknown, fieldName: string) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new BadGatewayException(`${fieldName} is required`);
+  }
+
+  return value;
+}
+
+function asRequiredPositiveInt(value: unknown, fieldName: string) {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+    throw new BadGatewayException(`${fieldName} must be a positive integer`);
+  }
+
+  return value;
+}
+
+function assertValidUrl(value: string, fieldName: string) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      throw new BadGatewayException(`${fieldName} must be a valid HTTP(S) URL`);
+    }
+  } catch {
+    throw new BadGatewayException(`${fieldName} must be a valid URL`);
+  }
+}
+
+function pad2(value: number) {
+  return String(value).padStart(2, '0');
+}
+
+function formatTBankDateTime(date: Date) {
+  const year = date.getFullYear();
+  const month = pad2(date.getMonth() + 1);
+  const day = pad2(date.getDate());
+  const hours = pad2(date.getHours());
+  const minutes = pad2(date.getMinutes());
+  const seconds = pad2(date.getSeconds());
+
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const offsetHours = pad2(Math.floor(Math.abs(offsetMinutes) / 60));
+  const offsetMins = pad2(Math.abs(offsetMinutes) % 60);
+
+  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}${sign}${offsetHours}:${offsetMins}`;
+}
+
+function isValidTBankDateTime(value: string) {
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/.test(value);
+}
+
+async function parseGatewayResponse(response: {
+  text?: () => Promise<string>;
+  json?: () => Promise<unknown>;
+}) {
+  if (typeof response.text === 'function') {
+    const rawText = await response.text();
+    if (!rawText.trim()) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(rawText) as unknown;
+    } catch {
+      return null;
+    }
+  }
+
+  if (typeof response.json === 'function') {
+    try {
+      return await response.json();
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+function sanitizePayloadForLogs(payload: unknown): unknown {
+  if (Array.isArray(payload)) {
+    return payload.map((value) => sanitizePayloadForLogs(value));
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    if (typeof payload === 'string' && payload.length > 300) {
+      return `${payload.slice(0, 300)}...`;
+    }
+    return payload;
+  }
+
+  const hiddenKeys = new Set([
+    'Token',
+    'Password',
+    'CardData',
+    'EncryptedPaymentData',
+    'PAN',
+    'CVV',
+    'CAVV',
+  ]);
+
+  return Object.fromEntries(
+    Object.entries(payload as Record<string, unknown>).map(([key, value]) => {
+      if (hiddenKeys.has(key)) {
+        return [key, '[REDACTED]'];
+      }
+
+      return [key, sanitizePayloadForLogs(value)];
+    }),
+  );
 }
 
 function getAdminPaymentsBoundaries(days: number) {
@@ -1568,7 +1989,8 @@ function getPaymentStatusMeta(status: PaymentOrderStatus) {
       return {
         label: 'Платёж возвращён',
         tone: 'muted',
-        message: 'Возврат выполнен. Абонемент при этом автоматически не отзывался.',
+        message:
+          'Возврат выполнен. Абонемент переведён в историю, а QR-код отключён.',
       };
     case PaymentOrderStatus.EXPIRED:
       return {

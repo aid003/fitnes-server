@@ -206,9 +206,20 @@ export class MembershipsService {
       },
       select: {
         id: true,
+        status: true,
+        endsAt: true,
         qrCodeSvg: true,
         qrGeneratedAt: true,
         qrPayload: true,
+        paymentOrders: {
+          select: {
+            status: true,
+          },
+          orderBy: {
+            createdAt: 'desc',
+          },
+          take: 1,
+        },
       },
     });
 
@@ -224,6 +235,17 @@ export class MembershipsService {
       throw new NotFoundException(
         'QR code is not available for this membership',
       );
+    }
+
+    const now = new Date();
+    const latestPayment = membership.paymentOrders[0];
+
+    if (membership.status !== MembershipStatus.ACTIVE || membership.endsAt <= now) {
+      throw new BadRequestException('QR code is no longer valid');
+    }
+
+    if (!latestPayment || latestPayment.status !== PaymentOrderStatus.PAID) {
+      throw new BadRequestException('QR code is no longer valid');
     }
 
     const payload = membership.qrPayload as MembershipQrPayload;
@@ -394,9 +416,110 @@ export class MembershipsService {
     });
   }
 
-  scanMembershipQr(content: string) {
+  async revokeMembershipAfterRefund(membershipId: string) {
+    const membership = await this.prisma.userMembership.findUnique({
+      where: { id: membershipId },
+      select: {
+        id: true,
+        status: true,
+        qrGeneratedAt: true,
+        qrCodeSvg: true,
+        qrSignature: true,
+        freezes: {
+          where: {
+            status: MembershipFreezeStatus.ACTIVE,
+          },
+          select: {
+            id: true,
+          },
+        },
+      },
+    });
+
+    if (!membership) {
+      return;
+    }
+
+    const hasActiveFreeze = membership.freezes.length > 0;
+    const hasQrData = Boolean(
+      membership.qrGeneratedAt || membership.qrCodeSvg || membership.qrSignature,
+    );
+    const alreadyRefunded = membership.status === MembershipStatus.REFUNDED;
+
+    if (alreadyRefunded && !hasActiveFreeze && !hasQrData) {
+      return;
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.userMembershipFreeze.updateMany({
+        where: {
+          membershipId,
+          status: MembershipFreezeStatus.ACTIVE,
+        },
+        data: {
+          status: MembershipFreezeStatus.CANCELLED,
+        },
+      }),
+      this.prisma.userMembership.update({
+        where: { id: membershipId },
+        data: {
+          status: MembershipStatus.REFUNDED,
+          qrPayload: Prisma.JsonNull,
+          qrSignature: null,
+          qrCodeSvg: null,
+          qrGeneratedAt: null,
+        },
+      }),
+    ]);
+  }
+
+  async scanMembershipQr(content: string) {
     const envelope = this.membershipQrService.parseAndVerify(content);
     const payload = envelope.payload;
+    const membership = await this.prisma.userMembership.findUnique({
+      where: {
+        id: payload.membershipId,
+      },
+      select: {
+        id: true,
+        title: true,
+        subtitle: true,
+        status: true,
+        startsAt: true,
+        endsAt: true,
+        freezeDaysLimit: true,
+        paymentOrders: {
+          select: {
+            status: true,
+          },
+          orderBy: {
+            createdAt: 'desc',
+          },
+          take: 1,
+        },
+      },
+    });
+
+    if (!membership) {
+      throw new BadRequestException(
+        'QR-код недействителен: абонемент не найден или отозван.',
+      );
+    }
+
+    const now = new Date();
+    const latestPayment = membership.paymentOrders[0];
+
+    if (membership.status !== MembershipStatus.ACTIVE || membership.endsAt <= now) {
+      throw new BadRequestException(
+        'QR-код недействителен: абонемент неактивен.',
+      );
+    }
+
+    if (!latestPayment || latestPayment.status !== PaymentOrderStatus.PAID) {
+      throw new BadRequestException(
+        'QR-код недействителен: оплата отменена или возвращена.',
+      );
+    }
 
     return {
       customer: {
@@ -405,13 +528,13 @@ export class MembershipsService {
         email: payload.user.email,
       },
       membership: {
-        id: payload.membershipId,
-        title: payload.membership.title,
-        subtitle: payload.membership.subtitle,
-        status: payload.membership.status,
-        startsAt: payload.membership.startsAt,
-        endsAt: payload.membership.endsAt,
-        freezeDaysLimit: payload.membership.freezeDaysLimit,
+        id: membership.id,
+        title: membership.title,
+        subtitle: membership.subtitle,
+        status: membership.status,
+        startsAt: membership.startsAt.toISOString(),
+        endsAt: membership.endsAt.toISOString(),
+        freezeDaysLimit: membership.freezeDaysLimit,
       },
       plan: payload.plan,
       payment: payload.payment,
@@ -699,6 +822,10 @@ export class MembershipsService {
     const now = new Date();
     const activeFreeze = getActiveFreeze(membership);
 
+    if (membership.status === MembershipStatus.REFUNDED) {
+      return membership;
+    }
+
     if (activeFreeze && activeFreeze.endsAt <= now) {
       const nextStatus =
         membership.endsAt <= now
@@ -842,7 +969,9 @@ export class MembershipsService {
       canRenew: membership.canRenew,
       canRequestRenewalNow: renewalAvailable,
       scheduleAvailable: false,
-      hasQr: Boolean(membership.qrGeneratedAt),
+      hasQr:
+        membership.status !== MembershipStatus.REFUNDED &&
+        Boolean(membership.qrGeneratedAt),
       history: buildMembershipHistory(membership),
     };
   }
@@ -860,7 +989,9 @@ export class MembershipsService {
       statusLabel: status.label,
       statusTone: status.tone,
       expiresAt: membership.endsAt.toISOString(),
-      hasQr: Boolean(membership.qrGeneratedAt),
+      hasQr:
+        membership.status !== MembershipStatus.REFUNDED &&
+        Boolean(membership.qrGeneratedAt),
       history: buildMembershipHistory(membership),
       features: membership.passPlan.features.map((feature) => ({
         id: feature.id,
@@ -970,6 +1101,13 @@ function buildMembershipHistory(membership: MembershipRecord) {
 }
 
 function getStatusMeta(status: MembershipStatus, canRequestRenewal: boolean) {
+  if (status === MembershipStatus.REFUNDED) {
+    return {
+      label: 'Возврат оформлен',
+      tone: 'muted',
+    };
+  }
+
   if (status === MembershipStatus.FROZEN) {
     return {
       label: 'Заморожен',

@@ -1,10 +1,16 @@
 import { BadRequestException, ForbiddenException } from '@nestjs/common';
+import { PaymentOrderStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { MembershipQrService } from './membership-qr.service';
 import { MembershipsService } from './memberships.service';
 
 describe('MembershipsService', () => {
   let membershipsService: MembershipsService;
   let prismaService: Record<string, any>;
+  let membershipQrService: {
+    createEnvelope: jest.Mock;
+    parseAndVerify: jest.Mock;
+  };
 
   const membershipRecord = {
     id: 'membership-1',
@@ -30,6 +36,15 @@ describe('MembershipsService', () => {
       title: 'Безлимит - Бассейн + Зал',
       subtitle: null,
       description: null,
+      group: {
+        title: 'Group',
+        variant: {
+          title: 'Variant',
+          category: {
+            title: 'Category',
+          },
+        },
+      },
       features: [
         {
           id: 'feature-1',
@@ -73,7 +88,15 @@ describe('MembershipsService', () => {
       ),
     };
 
-    membershipsService = new MembershipsService(prismaService as PrismaService);
+    membershipQrService = {
+      createEnvelope: jest.fn(),
+      parseAndVerify: jest.fn(),
+    };
+
+    membershipsService = new MembershipsService(
+      prismaService as PrismaService,
+      membershipQrService as unknown as MembershipQrService,
+    );
   });
 
   afterEach(() => {
@@ -86,7 +109,7 @@ describe('MembershipsService', () => {
       {
         ...membershipRecord,
         id: 'membership-2',
-        status: 'EXPIRED',
+        status: 'REFUNDED',
         canRenew: false,
       },
     ]);
@@ -95,6 +118,8 @@ describe('MembershipsService', () => {
 
     expect(result.activeMemberships).toHaveLength(1);
     expect(result.completedMemberships).toHaveLength(1);
+    expect(result.completedMemberships[0]?.status).toBe('REFUNDED');
+    expect(result.completedMemberships[0]?.hasQr).toBe(false);
   });
 
   it('rejects freeze when membership is already frozen', async () => {
@@ -237,5 +262,136 @@ describe('MembershipsService', () => {
         }),
       }),
     );
+  });
+
+  it('revokes refunded membership and clears QR snapshot', async () => {
+    prismaService.userMembership.findUnique.mockResolvedValue({
+      id: 'membership-1',
+      status: 'ACTIVE',
+      qrGeneratedAt: new Date('2026-03-01T00:00:00.000Z'),
+      qrCodeSvg: '<svg />',
+      qrSignature: 'signature',
+      freezes: [{ id: 'freeze-1' }],
+    });
+
+    await membershipsService.revokeMembershipAfterRefund('membership-1');
+
+    expect(prismaService.userMembershipFreeze.updateMany).toHaveBeenCalledWith({
+      where: {
+        membershipId: 'membership-1',
+        status: 'ACTIVE',
+      },
+      data: {
+        status: 'CANCELLED',
+      },
+    });
+    expect(prismaService.userMembership.update).toHaveBeenCalledWith({
+      where: { id: 'membership-1' },
+      data: expect.objectContaining({
+        status: 'REFUNDED',
+        qrSignature: null,
+        qrCodeSvg: null,
+        qrGeneratedAt: null,
+      }),
+    });
+  });
+
+  it('rejects QR view after refund', async () => {
+    prismaService.userMembership.findFirst.mockResolvedValue({
+      id: 'membership-1',
+      status: 'REFUNDED',
+      endsAt: new Date('2026-05-12T00:00:00.000Z'),
+      qrCodeSvg: '<svg />',
+      qrGeneratedAt: new Date('2026-03-01T00:00:00.000Z'),
+      qrPayload: {
+        user: {
+          name: 'User',
+          email: 'user@example.com',
+        },
+        plan: {
+          categoryTitle: 'Category',
+          variantTitle: 'Variant',
+          groupTitle: 'Group',
+          title: 'Безлимит',
+          subtitle: null,
+        },
+        membership: {
+          endsAt: '2026-05-12T00:00:00.000Z',
+        },
+        payment: {
+          amount: 8490,
+          currency: 'RUB',
+          paidAt: '2026-03-01T00:00:00.000Z',
+          merchantOrderNumber: 'fit-1',
+        },
+      },
+      paymentOrders: [{ status: PaymentOrderStatus.REFUNDED }],
+    });
+
+    await expect(
+      membershipsService.getMembershipQr('user-1', 'membership-1'),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('rejects scanned QR when payment was refunded', async () => {
+    membershipQrService.parseAndVerify.mockReturnValue({
+      version: 'membership-qr.v1',
+      payload: {
+        generatedAt: '2026-03-01T00:00:00.000Z',
+        membershipId: 'membership-1',
+        user: {
+          id: 'user-1',
+          name: 'User',
+          email: 'user@example.com',
+        },
+        membership: {
+          title: 'Безлимит',
+          subtitle: null,
+          status: 'ACTIVE',
+          startsAt: '2026-03-01T00:00:00.000Z',
+          endsAt: '2026-05-12T00:00:00.000Z',
+          freezeDaysLimit: 30,
+        },
+        plan: {
+          id: 'plan-1',
+          title: 'Безлимит',
+          subtitle: null,
+          description: null,
+          categoryTitle: 'Category',
+          variantTitle: 'Variant',
+          groupTitle: 'Group',
+          billingType: 'FIXED_TERM',
+          durationValue: 1,
+          durationUnit: 'MONTH',
+        },
+        payment: {
+          paymentId: 'payment-1',
+          merchantOrderNumber: 'fit-1',
+          gatewayOrderId: null,
+          status: 'PAID',
+          amount: 8490,
+          currency: 'RUB',
+          createdAt: '2026-03-01T00:00:00.000Z',
+          paidAt: '2026-03-01T00:00:00.000Z',
+          membershipIssuedAt: '2026-03-01T00:00:01.000Z',
+          actionCode: null,
+          actionCodeDescription: null,
+        },
+      },
+    });
+    prismaService.userMembership.findUnique.mockResolvedValue({
+      id: 'membership-1',
+      title: 'Безлимит',
+      subtitle: null,
+      status: 'ACTIVE',
+      startsAt: new Date('2026-03-01T00:00:00.000Z'),
+      endsAt: new Date('2026-05-12T00:00:00.000Z'),
+      freezeDaysLimit: 30,
+      paymentOrders: [{ status: PaymentOrderStatus.REFUNDED }],
+    });
+
+    await expect(
+      membershipsService.scanMembershipQr('raw-qr-content'),
+    ).rejects.toBeInstanceOf(BadRequestException);
   });
 });
