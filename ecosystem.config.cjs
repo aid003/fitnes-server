@@ -6,9 +6,10 @@ module.exports = {
       cwd: __dirname,
       instances: 1,
       exec_mode: 'fork',
+      autorestart: true,
       watch: false,
-      max_restarts: 10,
       min_uptime: '10s',
+      restart_delay: 5000,
     },
   ],
 };
