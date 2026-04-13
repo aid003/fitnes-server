@@ -7,12 +7,8 @@ import {
   Post,
   Req,
   Res,
-  UseGuards,
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
-import { CurrentUser } from '../common/auth/current-user.decorator';
-import { AuthenticatedGuard } from '../common/auth/authenticated.guard';
-import type { SessionUser } from '../common/auth/session-user.interface';
 import { AuthService } from './auth.service';
 import { LoginDto } from './dto/login.dto';
 import { RequestPasswordRecoveryDto } from './dto/request-password-recovery.dto';
@@ -34,8 +30,12 @@ export class AuthController {
 
   @Post('register/verify')
   @HttpCode(HttpStatus.OK)
-  verifyRegister(@Body() dto: VerifyRegisterDto, @Req() request: Request) {
-    return this.authService.verifyRegister(dto, request);
+  verifyRegister(
+    @Body() dto: VerifyRegisterDto,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    return this.authService.verifyRegister(dto, request, response);
   }
 
   @Post('register/resend')
@@ -46,8 +46,12 @@ export class AuthController {
 
   @Post('login')
   @HttpCode(HttpStatus.OK)
-  login(@Body() dto: LoginDto, @Req() request: Request) {
-    return this.authService.login(dto, request);
+  login(
+    @Body() dto: LoginDto,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    return this.authService.login(dto, request, response);
   }
 
   @Post('recovery/request')
@@ -81,14 +85,22 @@ export class AuthController {
     @Res({ passthrough: true }) response: Response,
   ) {
     const result = await this.authService.logout(request);
-    response.clearCookie('sid');
+    this.authService.clearAuthCookies(response);
 
     return result;
   }
 
   @Get('me')
-  @UseGuards(AuthenticatedGuard)
-  me(@CurrentUser() currentUser: SessionUser) {
-    return this.authService.getMe(currentUser.userId);
+  me(@Req() request: Request) {
+    return this.authService.getMeFromSession(request);
+  }
+
+  @Post('refresh-session')
+  @HttpCode(HttpStatus.OK)
+  refreshSession(
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    return this.authService.refreshSession(request, response);
   }
 }

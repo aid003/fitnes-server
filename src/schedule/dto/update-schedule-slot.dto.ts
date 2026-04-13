@@ -48,10 +48,6 @@ export class UpdateScheduleSlotDto {
   secondaryBadge?: string;
 
   @IsOptional()
-  @IsBoolean()
-  bookingEnabled?: boolean;
-
-  @IsOptional()
   @IsInt()
   @Min(0)
   sortOrder?: number;

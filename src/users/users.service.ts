@@ -138,7 +138,7 @@ export class UsersService {
     }
 
     try {
-      return await this.prisma.user.update({
+      const updatedUser = await this.prisma.user.update({
         where: { id: userId },
         data: {
           name: dto.name,
@@ -148,6 +148,20 @@ export class UsersService {
         },
         select: userPublicSelect,
       });
+
+      if (dto.newPassword) {
+        await this.prisma.rememberSession.updateMany({
+          where: {
+            userId,
+            revokedAt: null,
+          },
+          data: {
+            revokedAt: new Date(),
+          },
+        });
+      }
+
+      return updatedUser;
     } catch (error) {
       handlePrismaError(error, 'User');
     }

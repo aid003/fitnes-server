@@ -16,9 +16,11 @@ export class CreateMembershipDto {
   @IsString()
   passPlanId!: string;
 
+  @IsOptional()
   @IsISO8601()
   startsAt!: string;
 
+  @IsOptional()
   @IsISO8601()
   endsAt!: string;
 

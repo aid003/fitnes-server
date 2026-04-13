@@ -13,6 +13,9 @@ describe('UsersService', () => {
       findMany: jest.Mock;
       create: jest.Mock;
     };
+    rememberSession: {
+      updateMany: jest.Mock;
+    };
   };
   let passwordService: {
     hash: jest.Mock;
@@ -26,6 +29,9 @@ describe('UsersService', () => {
         update: jest.fn(),
         findMany: jest.fn(),
         create: jest.fn(),
+      },
+      rememberSession: {
+        updateMany: jest.fn(),
       },
     };
 

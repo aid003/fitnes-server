@@ -8,6 +8,7 @@ import { MailModule } from '../mail/mail.module';
 import { UsersModule } from '../users/users.module';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
+import { RememberSessionService } from './session/remember-session.service';
 import { SessionService } from './session/session.service';
 
 @Module({
@@ -16,6 +17,7 @@ import { SessionService } from './session/session.service';
   providers: [
     AuthService,
     SessionService,
+    RememberSessionService,
     PasswordService,
     {
       provide: APP_GUARD,

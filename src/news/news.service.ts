@@ -142,15 +142,19 @@ export class NewsService {
   }
 
   private buildCreateData(dto: CreateNewsArticleDto): Prisma.NewsArticleCreateInput {
+    const highlights = dto.highlights !== undefined ? normalizeStringArray(dto.highlights) : undefined;
+    const tags = dto.tags !== undefined ? normalizeStringArray(dto.tags) : undefined;
+    const highlightsTitle = dto.highlightsTitle?.trim() || undefined;
+
     return {
       title: dto.title.trim(),
       slug: dto.slug.trim(),
-      excerpt: dto.excerpt?.trim(),
-      lead: dto.lead?.trim(),
-      highlightsTitle: dto.highlightsTitle?.trim(),
-      highlights: dto.highlights !== undefined ? normalizeStringArray(dto.highlights) : undefined,
+      excerpt: dto.excerpt?.trim() || undefined,
+      lead: dto.lead?.trim() || undefined,
+      highlightsTitle: highlights && highlights.length > 0 ? highlightsTitle : undefined,
+      highlights,
       contentRichText: dto.contentRichText.trim(),
-      tags: dto.tags !== undefined ? normalizeStringArray(dto.tags) : undefined,
+      tags,
       publishedAt: dto.publishedAt ? new Date(dto.publishedAt) : undefined,
       sortOrder: dto.sortOrder ?? 0,
       isPublished: dto.isPublished ?? false,
@@ -158,18 +162,28 @@ export class NewsService {
   }
 
   private buildUpdateData(dto: UpdateNewsArticleDto): Prisma.NewsArticleUpdateInput {
+    const hasHighlights = dto.highlights !== undefined;
+    const normalizedHighlights = hasHighlights ? normalizeStringArray(dto.highlights) : undefined;
+    const normalizedTags = dto.tags !== undefined ? normalizeStringArray(dto.tags) : undefined;
+
     return {
       title: typeof dto.title === 'string' ? dto.title.trim() : undefined,
       slug: typeof dto.slug === 'string' ? dto.slug.trim() : undefined,
-      excerpt: typeof dto.excerpt === 'string' ? dto.excerpt.trim() : undefined,
-      lead: typeof dto.lead === 'string' ? dto.lead.trim() : undefined,
+      excerpt:
+        typeof dto.excerpt === 'string' ? dto.excerpt.trim() || null : undefined,
+      lead: typeof dto.lead === 'string' ? dto.lead.trim() || null : undefined,
       highlightsTitle:
-        typeof dto.highlightsTitle === 'string' ? dto.highlightsTitle.trim() : undefined,
-      highlights:
-        dto.highlights !== undefined ? normalizeStringArray(dto.highlights) : undefined,
+        typeof dto.highlightsTitle === 'string'
+          ? dto.highlightsTitle.trim()
+            ? dto.highlightsTitle.trim()
+            : null
+          : hasHighlights && normalizedHighlights?.length === 0
+            ? null
+            : undefined,
+      highlights: hasHighlights ? normalizedHighlights : undefined,
       contentRichText:
         typeof dto.contentRichText === 'string' ? dto.contentRichText.trim() : undefined,
-      tags: dto.tags !== undefined ? normalizeStringArray(dto.tags) : undefined,
+      tags: dto.tags !== undefined ? normalizedTags : undefined,
       publishedAt:
         dto.publishedAt !== undefined
           ? dto.publishedAt

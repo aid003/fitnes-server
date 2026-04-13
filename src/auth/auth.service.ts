@@ -7,7 +7,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { EmailChallengePurpose } from '@prisma/client';
-import type { Request } from 'express';
+import type { Request, Response } from 'express';
 import { randomInt } from 'node:crypto';
 import { PasswordService } from '../common/security/password.service';
 import { setAuthenticatedSession } from '../common/auth/session-auth.util';
@@ -19,6 +19,8 @@ import { UsersService } from '../users/users.service';
 import { RequestPasswordRecoveryDto } from './dto/request-password-recovery.dto';
 import { ResendRegisterCodeDto } from './dto/resend-register-code.dto';
 import { ResetPasswordRecoveryDto } from './dto/reset-password-recovery.dto';
+import { RememberSessionService } from './session/remember-session.service';
+import { SessionService } from './session/session.service';
 import { VerifyRegisterDto } from './dto/verify-register.dto';
 import { VerifyPasswordRecoveryDto } from './dto/verify-password-recovery.dto';
 
@@ -33,6 +35,8 @@ export class AuthService {
     private readonly passwordService: PasswordService,
     private readonly prisma: PrismaService,
     private readonly mailService: MailService,
+    private readonly rememberSessionService: RememberSessionService,
+    private readonly sessionService: SessionService,
   ) {}
 
   async register(dto: RegisterDto): Promise<{ success: true }> {
@@ -96,7 +100,11 @@ export class AuthService {
     return { success: true };
   }
 
-  async verifyRegister(dto: VerifyRegisterDto, request: Request) {
+  async verifyRegister(
+    dto: VerifyRegisterDto,
+    request: Request,
+    response: Response,
+  ) {
     const user = await this.usersService.findByEmail(dto.email);
 
     if (!user) {
@@ -144,6 +152,7 @@ export class AuthService {
       id: updatedUser.id,
       role: updatedUser.role,
     });
+    await this.rememberSessionService.issue(updatedUser.id, response);
 
     return updatedUser;
   }
@@ -171,7 +180,7 @@ export class AuthService {
     return { success: true };
   }
 
-  async login(dto: LoginDto, request: Request) {
+  async login(dto: LoginDto, request: Request, response: Response) {
     const user = await this.usersService.findByEmail(dto.email);
 
     if (!user) {
@@ -195,11 +204,16 @@ export class AuthService {
       id: user.id,
       role: user.role,
     });
+    await this.rememberSessionService.issue(user.id, response);
 
     return this.usersService.getPublicById(user.id);
   }
 
   async logout(request: Request): Promise<{ success: true }> {
+    await this.rememberSessionService.revokeByToken(
+      this.getRememberTokenFromRequest(request),
+    );
+
     return new Promise((resolve, reject) => {
       request.session.destroy((error) => {
         if (error) {
@@ -214,6 +228,54 @@ export class AuthService {
         resolve({ success: true });
       });
     });
+  }
+
+  async getMeFromSession(request: Request) {
+    const userId = request.session?.auth?.userId;
+
+    if (!userId) {
+      throw new UnauthorizedException('Authentication required');
+    }
+
+    return this.usersService.getMe(userId);
+  }
+
+  async refreshSession(request: Request, response: Response) {
+    const rawToken = this.getRememberTokenFromRequest(request);
+
+    if (!rawToken) {
+      throw new UnauthorizedException('Authentication required');
+    }
+
+    const rememberedSession = await this.rememberSessionService.rotate(
+      rawToken,
+      response,
+    );
+
+    if (!rememberedSession) {
+      this.clearAuthCookies(response);
+      throw new UnauthorizedException('Authentication required');
+    }
+
+    const user = await this.usersService.getAuthState(rememberedSession.userId);
+
+    if (!user.isActive) {
+      await this.rememberSessionService.revokeAllForUser(user.id);
+      this.clearAuthCookies(response);
+      throw new UnauthorizedException('Authentication required');
+    }
+
+    await setAuthenticatedSession(request, {
+      id: user.id,
+      role: user.role,
+    });
+
+    return this.usersService.getMe(user.id);
+  }
+
+  clearAuthCookies(response: Response): void {
+    this.sessionService.clearSessionCookie(response);
+    this.sessionService.clearRememberCookie(response);
   }
 
   getMe(userId: string) {
@@ -343,6 +405,7 @@ export class AuthService {
         },
       }),
     ]);
+    await this.rememberSessionService.revokeAllForUser(user.id);
 
     return { success: true };
   }
@@ -482,6 +545,27 @@ export class AuthService {
         'Повторная отправка будет доступна через 60 секунд',
       );
     }
+  }
+
+  private getRememberTokenFromRequest(request: Request): string | undefined {
+    const cookieHeader = request.headers.cookie;
+
+    if (!cookieHeader) {
+      return undefined;
+    }
+
+    const rememberCookieName = this.sessionService.getRememberCookieName();
+
+    for (const chunk of cookieHeader.split(';')) {
+      const trimmedChunk = chunk.trim();
+      const [name, ...rest] = trimmedChunk.split('=');
+
+      if (name === rememberCookieName) {
+        return decodeURIComponent(rest.join('='));
+      }
+    }
+
+    return undefined;
   }
 }
 

@@ -23,7 +23,6 @@ const templateSlotSelect = {
   endTime: true,
   ageBadge: true,
   secondaryBadge: true,
-  bookingEnabled: true,
   sortOrder: true,
   isActive: true,
   createdAt: true,
@@ -387,7 +386,6 @@ export class ScheduleService implements OnModuleInit {
       endTime: slot.endTime,
       ageBadge: slot.ageBadge,
       secondaryBadge: slot.secondaryBadge,
-      bookingEnabled: slot.bookingEnabled,
       sortOrder: slot.sortOrder,
     }));
   }
@@ -411,7 +409,6 @@ function normalizeSlotInput(slot: CreateScheduleSlotDto) {
     endTime: slot.endTime,
     ageBadge: slot.ageBadge?.trim() || null,
     secondaryBadge: slot.secondaryBadge?.trim() || null,
-    bookingEnabled: slot.bookingEnabled ?? true,
     sortOrder: slot.sortOrder ?? 0,
     isActive: slot.isActive ?? true,
   };
@@ -426,7 +423,6 @@ function normalizeSlotUpdateInput(slot: UpdateScheduleSlotDto) {
     ageBadge: slot.ageBadge !== undefined ? slot.ageBadge.trim() || null : undefined,
     secondaryBadge:
       slot.secondaryBadge !== undefined ? slot.secondaryBadge.trim() || null : undefined,
-    bookingEnabled: slot.bookingEnabled,
     sortOrder: slot.sortOrder,
     isActive: slot.isActive,
   };

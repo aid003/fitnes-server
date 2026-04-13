@@ -6,7 +6,9 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { EmailChallengePurpose, UserRole } from '@prisma/client';
-import type { Request } from 'express';
+import type { Request, Response } from 'express';
+import { RememberSessionService } from './session/remember-session.service';
+import { SessionService } from './session/session.service';
 import { PasswordService } from '../common/security/password.service';
 import { MailService } from '../mail/mail.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -20,6 +22,7 @@ describe('AuthService', () => {
     findByEmail: jest.Mock;
     createUser: jest.Mock;
     getPublicById: jest.Mock;
+    getAuthState: jest.Mock;
     getMe: jest.Mock;
   };
   let passwordService: {
@@ -44,12 +47,24 @@ describe('AuthService', () => {
     sendRegistrationCode: jest.Mock;
     sendPasswordRecoveryCode: jest.Mock;
   };
+  let rememberSessionService: {
+    issue: jest.Mock;
+    rotate: jest.Mock;
+    revokeByToken: jest.Mock;
+    revokeAllForUser: jest.Mock;
+  };
+  let sessionService: {
+    clearSessionCookie: jest.Mock;
+    clearRememberCookie: jest.Mock;
+    getRememberCookieName: jest.Mock;
+  };
 
   beforeEach(() => {
     usersService = {
       findByEmail: jest.fn(),
       createUser: jest.fn(),
       getPublicById: jest.fn(),
+      getAuthState: jest.fn(),
       getMe: jest.fn(),
     };
 
@@ -87,11 +102,26 @@ describe('AuthService', () => {
       sendPasswordRecoveryCode: jest.fn(),
     };
 
+    rememberSessionService = {
+      issue: jest.fn(),
+      rotate: jest.fn(),
+      revokeByToken: jest.fn(),
+      revokeAllForUser: jest.fn(),
+    };
+
+    sessionService = {
+      clearSessionCookie: jest.fn(),
+      clearRememberCookie: jest.fn(),
+      getRememberCookieName: jest.fn().mockReturnValue('remember_sid'),
+    };
+
     authService = new AuthService(
       usersService as unknown as UsersService,
       passwordService as unknown as PasswordService,
       prismaService as unknown as PrismaService,
       mailService as unknown as MailService,
+      rememberSessionService as unknown as RememberSessionService,
+      sessionService as unknown as SessionService,
     );
   });
 
@@ -140,6 +170,7 @@ describe('AuthService', () => {
 
   it('rejects login for inactive users', async () => {
     const request = createRequest();
+    const response = createResponse();
 
     usersService.findByEmail.mockResolvedValue(
       createStoredUser({ isActive: false }),
@@ -152,12 +183,14 @@ describe('AuthService', () => {
           password: 'password123',
         },
         request,
+        response,
       ),
     ).rejects.toBeInstanceOf(ForbiddenException);
   });
 
   it('rejects login when password is invalid', async () => {
     const request = createRequest();
+    const response = createResponse();
 
     usersService.findByEmail.mockResolvedValue(createStoredUser());
     passwordService.compare.mockResolvedValue(false);
@@ -169,6 +202,7 @@ describe('AuthService', () => {
           password: 'password123',
         },
         request,
+        response,
       ),
     ).rejects.toBeInstanceOf(UnauthorizedException);
   });
@@ -187,6 +221,7 @@ describe('AuthService', () => {
 
   it('verifies register code, activates user and creates session', async () => {
     const request = createRequest();
+    const response = createResponse();
 
     usersService.findByEmail.mockResolvedValue(createStoredUser({ isActive: false }));
     prismaService.emailLoginChallenge.findUnique.mockResolvedValue({
@@ -205,6 +240,7 @@ describe('AuthService', () => {
         code: '123456',
       },
       request,
+      response,
     );
 
     expect(prismaService.emailLoginChallenge.delete).toHaveBeenCalledWith({
@@ -219,7 +255,65 @@ describe('AuthService', () => {
       userId: 'user-1',
       role: UserRole.USER,
     });
+    expect(rememberSessionService.issue).toHaveBeenCalledWith('user-1', response);
     expect(result.email).toBe('test@example.com');
+  });
+
+  it('creates remember cookie on login', async () => {
+    const request = createRequest();
+    const response = createResponse();
+
+    usersService.findByEmail.mockResolvedValue(createStoredUser());
+    usersService.getPublicById.mockResolvedValue(createPublicUser());
+    passwordService.compare.mockResolvedValue(true);
+
+    const result = await authService.login(
+      {
+        email: 'test@example.com',
+        password: 'password123',
+      },
+      request,
+      response,
+    );
+
+    expect(rememberSessionService.issue).toHaveBeenCalledWith('user-1', response);
+    expect(result).toMatchObject({
+      id: 'user-1',
+      email: 'test@example.com',
+    });
+  });
+
+  it('restores session from remember token', async () => {
+    const request = createRequest('remember_sid=remember-token');
+    const response = createResponse();
+
+    rememberSessionService.rotate.mockResolvedValue({
+      id: 'remember-1',
+      userId: 'user-1',
+      expiresAt: new Date(Date.now() + 60_000),
+      revokedAt: null,
+    });
+    usersService.getAuthState = jest.fn().mockResolvedValue({
+      id: 'user-1',
+      role: UserRole.USER,
+      isActive: true,
+    });
+    usersService.getMe.mockResolvedValue(createPublicUser());
+
+    const result = await authService.refreshSession(request, response);
+
+    expect(rememberSessionService.rotate).toHaveBeenCalledWith(
+      'remember-token',
+      response,
+    );
+    expect(request.session.auth).toEqual({
+      userId: 'user-1',
+      role: UserRole.USER,
+    });
+    expect(result).toMatchObject({
+      id: 'user-1',
+      email: 'test@example.com',
+    });
   });
 
   it('creates a recovery challenge for an existing user', async () => {
@@ -315,6 +409,7 @@ describe('AuthService', () => {
       where: { id: 'user-1' },
       data: { passwordHash: 'hashed-password' },
     });
+    expect(rememberSessionService.revokeAllForUser).toHaveBeenCalledWith('user-1');
     expect(result).toEqual({ success: true });
   });
 
@@ -349,13 +444,18 @@ describe('AuthService', () => {
   });
 });
 
-function createRequest(): Request {
+function createRequest(cookieHeader?: string): Request {
   return {
+    headers: cookieHeader ? { cookie: cookieHeader } : {},
     session: {
       save: (callback: (error?: Error) => void) => callback(),
       destroy: (callback: (error?: Error) => void) => callback(),
     },
   } as unknown as Request;
+}
+
+function createResponse(): Response {
+  return {} as Response;
 }
 
 function createPublicUser(): PublicUser {

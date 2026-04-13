@@ -17,6 +17,12 @@ export function setupApp(app: INestApplication): AppDocsConfig {
   const configService = app.get(ConfigService);
   const frontendOrigin =
     configService.get<string>('FRONTEND_ORIGIN') ?? 'http://localhost:3000';
+  const appBaseUrl =
+    configService.get<string>('APP_BASE_URL') ?? frontendOrigin;
+
+  if (appBaseUrl.startsWith('https://')) {
+    app.getHttpAdapter().getInstance().set('trust proxy', 1);
+  }
 
   app.useGlobalInterceptors(new LoggerErrorInterceptor());
   app.useGlobalPipes(

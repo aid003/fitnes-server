@@ -13,6 +13,7 @@ import {
   Prisma,
 } from '@prisma/client';
 import { handlePrismaError } from '../common/database/prisma-errors';
+import { kopecksToRubles } from '../common/money/money';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateMembershipDto } from './dto/create-membership.dto';
 import { CreateMembershipFreezeDto } from './dto/create-membership-freeze.dto';
@@ -21,20 +22,29 @@ import {
   MembershipQrService,
 } from './membership-qr.service';
 import { UpdateMembershipDto } from './dto/update-membership.dto';
-import { kopecksToRubles } from '../common/money/money';
 
 const DAY_IN_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_FREEZE_DAYS = 7;
 const RENEWAL_WINDOW_DAYS = 14;
+
+type UsageMode = 'TERM' | 'VISIT';
+type ActivationStatus = 'PENDING' | 'ACTIVATED';
 
 const membershipSelect = {
   id: true,
   title: true,
   subtitle: true,
   description: true,
+  issuedAt: true,
+  activatedAt: true,
   startsAt: true,
   endsAt: true,
   status: true,
+  billingType: true,
+  durationValue: true,
+  durationUnit: true,
+  totalVisits: true,
+  usedVisits: true,
   freezeDaysLimit: true,
   freezeDaysUsed: true,
   canRenew: true,
@@ -55,6 +65,10 @@ const membershipSelect = {
       title: true,
       subtitle: true,
       description: true,
+      billingType: true,
+      durationValue: true,
+      durationUnit: true,
+      visitCount: true,
       group: {
         select: {
           title: true,
@@ -109,6 +123,26 @@ type MembershipRecord = Prisma.UserMembershipGetPayload<{
   select: typeof membershipSelect;
 }>;
 
+type MembershipSnapshot = {
+  billingType: BillingType | null;
+  durationValue: number | null;
+  durationUnit: DurationUnit | null;
+  totalVisits: number | null;
+};
+
+type SnapshotCarrier = {
+  billingType?: BillingType | null;
+  durationValue?: number | null;
+  durationUnit?: DurationUnit | null;
+  totalVisits?: number | null;
+  passPlan?: {
+    billingType: BillingType | null;
+    durationValue: number | null;
+    durationUnit: DurationUnit | null;
+    visitCount: number | null;
+  };
+};
+
 @Injectable()
 export class MembershipsService {
   constructor(
@@ -137,6 +171,7 @@ export class MembershipsService {
         durationValue: true,
         durationUnit: true,
         billingType: true,
+        visitCount: true,
       },
     });
 
@@ -144,8 +179,7 @@ export class MembershipsService {
       throw new NotFoundException('Pass plan not found');
     }
 
-    const startsAt = input.paidAt ?? new Date();
-    const endsAt = calculateMembershipEndsAt(startsAt, passPlan);
+    const issuedAt = input.paidAt ?? new Date();
 
     return this.prisma.userMembership.create({
       data: {
@@ -155,14 +189,18 @@ export class MembershipsService {
         subtitle: input.subtitle?.trim() || passPlan.subtitle || undefined,
         description:
           input.description?.trim() || passPlan.description || undefined,
-        startsAt,
-        endsAt,
-        status:
-          endsAt <= new Date()
-            ? MembershipStatus.EXPIRED
-            : MembershipStatus.ACTIVE,
+        issuedAt,
+        activatedAt: null,
+        startsAt: issuedAt,
+        endsAt: issuedAt,
+        status: MembershipStatus.PENDING_ACTIVATION,
+        billingType: passPlan.billingType,
+        durationValue: passPlan.durationValue,
+        durationUnit: passPlan.durationUnit,
+        totalVisits: passPlan.visitCount,
+        usedVisits: 0,
         freezeDaysLimit: input.freezeDaysLimit ?? 0,
-        canRenew: true,
+        canRenew: !isVisitBased(passPlan.billingType),
         sortOrder: 0,
       },
       select: {
@@ -179,7 +217,7 @@ export class MembershipsService {
       select: membershipSelect,
       orderBy: [
         { sortOrder: 'asc' },
-        { startsAt: 'desc' },
+        { issuedAt: 'desc' },
         { createdAt: 'desc' },
       ],
     });
@@ -207,7 +245,12 @@ export class MembershipsService {
       select: {
         id: true,
         status: true,
+        activatedAt: true,
+        startsAt: true,
         endsAt: true,
+        billingType: true,
+        totalVisits: true,
+        usedVisits: true,
         qrCodeSvg: true,
         qrGeneratedAt: true,
         qrPayload: true,
@@ -237,14 +280,16 @@ export class MembershipsService {
       );
     }
 
-    const now = new Date();
     const latestPayment = membership.paymentOrders[0];
 
-    if (membership.status !== MembershipStatus.ACTIVE || membership.endsAt <= now) {
+    if (
+      membership.status === MembershipStatus.REFUNDED ||
+      (!latestPayment || latestPayment.status !== PaymentOrderStatus.PAID)
+    ) {
       throw new BadRequestException('QR code is no longer valid');
     }
 
-    if (!latestPayment || latestPayment.status !== PaymentOrderStatus.PAID) {
+    if (isMembershipExhausted(membership)) {
       throw new BadRequestException('QR code is no longer valid');
     }
 
@@ -269,6 +314,13 @@ export class MembershipsService {
         paidAt: payload.payment.paidAt,
         merchantOrderNumber: payload.payment.merchantOrderNumber,
         expiresAt: payload.membership.endsAt,
+        membershipStateLabel: getMembershipStateLabelFromData({
+          status: membership.status,
+          billingType: membership.billingType,
+          totalVisits: membership.totalVisits,
+          usedVisits: membership.usedVisits,
+          endsAt: membership.endsAt,
+        }),
       },
     };
   }
@@ -310,6 +362,7 @@ export class MembershipsService {
             billingType: true,
             durationValue: true,
             durationUnit: true,
+            visitCount: true,
             group: {
               select: {
                 title: true,
@@ -337,8 +390,15 @@ export class MembershipsService {
         title: true,
         subtitle: true,
         status: true,
+        issuedAt: true,
+        activatedAt: true,
         startsAt: true,
         endsAt: true,
+        billingType: true,
+        durationValue: true,
+        durationUnit: true,
+        totalVisits: true,
+        usedVisits: true,
         freezeDaysLimit: true,
         qrGeneratedAt: true,
       },
@@ -354,10 +414,6 @@ export class MembershipsService {
       );
     }
 
-    if (membership.qrGeneratedAt) {
-      return;
-    }
-
     const generatedAt = new Date();
     const payload: MembershipQrPayload = {
       membershipId: membership.id,
@@ -370,9 +426,22 @@ export class MembershipsService {
         title: membership.title,
         subtitle: membership.subtitle,
         status: membership.status,
-        startsAt: membership.startsAt.toISOString(),
-        endsAt: membership.endsAt.toISOString(),
+        issuedAt: membership.issuedAt.toISOString(),
+        activatedAt: membership.activatedAt?.toISOString() ?? null,
+        startsAt:
+          membership.activatedAt &&
+          !isVisitBased(resolveSnapshot(membership).billingType)
+          ? membership.startsAt.toISOString()
+          : null,
+        endsAt:
+          membership.activatedAt &&
+          !isVisitBased(resolveSnapshot(membership).billingType)
+          ? membership.endsAt.toISOString()
+          : null,
         freezeDaysLimit: membership.freezeDaysLimit,
+        billingType: resolveSnapshot(membership).billingType,
+        totalVisits: resolveSnapshot(membership).totalVisits,
+        usedVisits: membership.usedVisits,
       },
       plan: {
         id: paymentOrder.passPlan.id,
@@ -386,6 +455,7 @@ export class MembershipsService {
         billingType: paymentOrder.passPlan.billingType,
         durationValue: paymentOrder.passPlan.durationValue,
         durationUnit: paymentOrder.passPlan.durationUnit,
+        visitCount: paymentOrder.passPlan.visitCount,
       },
       payment: {
         paymentId: paymentOrder.id,
@@ -485,8 +555,15 @@ export class MembershipsService {
         title: true,
         subtitle: true,
         status: true,
+        issuedAt: true,
+        activatedAt: true,
         startsAt: true,
         endsAt: true,
+        billingType: true,
+        durationValue: true,
+        durationUnit: true,
+        totalVisits: true,
+        usedVisits: true,
         freezeDaysLimit: true,
         paymentOrders: {
           select: {
@@ -506,20 +583,110 @@ export class MembershipsService {
       );
     }
 
-    const now = new Date();
     const latestPayment = membership.paymentOrders[0];
-
-    if (membership.status !== MembershipStatus.ACTIVE || membership.endsAt <= now) {
-      throw new BadRequestException(
-        'QR-код недействителен: абонемент неактивен.',
-      );
-    }
 
     if (!latestPayment || latestPayment.status !== PaymentOrderStatus.PAID) {
       throw new BadRequestException(
         'QR-код недействителен: оплата отменена или возвращена.',
       );
     }
+
+    if (membership.status === MembershipStatus.REFUNDED) {
+      throw new BadRequestException(
+        'QR-код недействителен: абонемент неактивен.',
+      );
+    }
+
+    if (membership.status === MembershipStatus.FROZEN) {
+      throw new BadRequestException(
+        'Абонемент сейчас заморожен. Сначала снимите заморозку.',
+      );
+    }
+
+    const snapshot = resolveSnapshot(membership);
+    const usageMode = getUsageMode(snapshot.billingType);
+    const totalVisits = snapshot.totalVisits;
+    const now = new Date();
+    const activationPerformed =
+      membership.status === MembershipStatus.PENDING_ACTIVATION;
+
+    if (
+      usageMode === 'TERM' &&
+      membership.status !== MembershipStatus.PENDING_ACTIVATION &&
+      membership.endsAt <= now
+    ) {
+      await this.prisma.userMembership.update({
+        where: { id: membership.id },
+        data: { status: MembershipStatus.EXPIRED },
+      });
+
+      throw new BadRequestException('Срок действия абонемента уже закончился.');
+    }
+
+    if (
+      usageMode === 'VISIT' &&
+      totalVisits !== null &&
+      membership.usedVisits >= totalVisits
+    ) {
+      await this.prisma.userMembership.update({
+        where: { id: membership.id },
+        data: { status: MembershipStatus.EXPIRED },
+      });
+
+      throw new BadRequestException('Все посещения по этому абонементу уже использованы.');
+    }
+
+    const nextStartsAt = activationPerformed ? now : membership.startsAt;
+    const nextEndsAt = activationPerformed
+      ? calculateEndsAtForActivation(now, snapshot)
+      : membership.endsAt;
+
+    let visitConsumed = false;
+    let nextUsedVisits = membership.usedVisits;
+
+    if (usageMode === 'VISIT') {
+      visitConsumed = true;
+      nextUsedVisits += 1;
+    }
+
+    const remainingVisits =
+      totalVisits === null ? null : Math.max(0, totalVisits - nextUsedVisits);
+    const shouldExpire =
+      usageMode === 'VISIT'
+        ? remainingVisits !== null && remainingVisits <= 0
+        : nextEndsAt <= now;
+    const nextStatus = shouldExpire
+      ? MembershipStatus.EXPIRED
+      : MembershipStatus.ACTIVE;
+
+    const updated = await this.prisma.userMembership.update({
+      where: { id: membership.id },
+      data: {
+        status: nextStatus,
+        activatedAt: activationPerformed ? now : membership.activatedAt,
+        startsAt: nextStartsAt,
+        endsAt: nextEndsAt,
+        usedVisits: nextUsedVisits,
+      },
+      select: {
+        id: true,
+        title: true,
+        subtitle: true,
+        status: true,
+        issuedAt: true,
+        activatedAt: true,
+        startsAt: true,
+        endsAt: true,
+        billingType: true,
+        durationValue: true,
+        durationUnit: true,
+        totalVisits: true,
+        usedVisits: true,
+        freezeDaysLimit: true,
+      },
+    });
+
+    await this.attachQrSnapshotFromPayment(membership.id, payload.payment.paymentId);
 
     return {
       customer: {
@@ -528,21 +695,44 @@ export class MembershipsService {
         email: payload.user.email,
       },
       membership: {
-        id: membership.id,
-        title: membership.title,
-        subtitle: membership.subtitle,
-        status: membership.status,
-        startsAt: membership.startsAt.toISOString(),
-        endsAt: membership.endsAt.toISOString(),
-        freezeDaysLimit: membership.freezeDaysLimit,
+        id: updated.id,
+        title: updated.title,
+        subtitle: updated.subtitle,
+        status: updated.status,
+        activationStatus:
+          updated.status === MembershipStatus.PENDING_ACTIVATION
+            ? 'PENDING'
+            : 'ACTIVATED',
+        issuedAt: updated.issuedAt.toISOString(),
+        activatedAt: updated.activatedAt?.toISOString() ?? null,
+        startsAt:
+          usageMode === 'TERM' ? updated.startsAt.toISOString() : null,
+        endsAt: usageMode === 'TERM' ? updated.endsAt.toISOString() : null,
+        freezeDaysLimit: updated.freezeDaysLimit,
+        billingType: snapshot.billingType,
+        totalVisits,
+        usedVisits: updated.usedVisits,
+        remainingVisits,
       },
-      plan: payload.plan,
+      plan: {
+        ...payload.plan,
+      },
       payment: payload.payment,
       verification: {
         isSignatureValid: true,
         version: envelope.version,
         generatedAt: payload.generatedAt,
       },
+      activationPerformed,
+      visitConsumed,
+      remainingVisits,
+      membershipStateLabel: getMembershipStateLabelFromData({
+        status: updated.status,
+        billingType: updated.billingType,
+        totalVisits,
+        usedVisits: updated.usedVisits,
+        endsAt: updated.endsAt,
+      }),
     };
   }
 
@@ -561,6 +751,12 @@ export class MembershipsService {
 
     if (synced.status !== MembershipStatus.ACTIVE) {
       throw new BadRequestException('Only active memberships can be frozen');
+    }
+
+    if (getUsageMode(resolveSnapshot(synced).billingType) === 'VISIT') {
+      throw new BadRequestException(
+        'Абонементы по посещениям нельзя замораживать по дням.',
+      );
     }
 
     const freezeDaysLeft = Math.max(
@@ -622,6 +818,10 @@ export class MembershipsService {
         title: true,
         subtitle: true,
         description: true,
+        billingType: true,
+        durationValue: true,
+        durationUnit: true,
+        visitCount: true,
       },
     });
 
@@ -629,18 +829,27 @@ export class MembershipsService {
       throw new NotFoundException('Pass plan not found');
     }
 
-    const startsAt = parseDate(dto.startsAt, 'startsAt');
-    const endsAt = parseDate(dto.endsAt, 'endsAt');
+    const issuedAt = new Date();
+    const startsAt = dto.startsAt ? parseDate(dto.startsAt, 'startsAt') : issuedAt;
+    const endsAt = dto.endsAt
+      ? parseDate(dto.endsAt, 'endsAt')
+      : calculateEndsAtForActivation(issuedAt, {
+          billingType: passPlan.billingType,
+          durationValue: passPlan.durationValue,
+          durationUnit: passPlan.durationUnit,
+          totalVisits: passPlan.visitCount,
+        });
 
-    if (startsAt >= endsAt) {
+    if (startsAt > endsAt) {
       throw new BadRequestException('endsAt must be later than startsAt');
     }
 
-    const status =
-      dto.status ??
-      (endsAt <= new Date()
+    const hasManualPeriod = Boolean(dto.startsAt && dto.endsAt);
+    const defaultStatus = hasManualPeriod
+      ? endsAt <= new Date()
         ? MembershipStatus.EXPIRED
-        : MembershipStatus.ACTIVE);
+        : MembershipStatus.ACTIVE
+      : MembershipStatus.PENDING_ACTIVATION;
 
     try {
       await this.prisma.userMembership.create({
@@ -651,11 +860,18 @@ export class MembershipsService {
           subtitle: dto.subtitle?.trim() || passPlan.subtitle || undefined,
           description:
             dto.description?.trim() || passPlan.description || undefined,
+          issuedAt,
+          activatedAt: hasManualPeriod ? startsAt : null,
           startsAt,
           endsAt,
-          status,
+          status: dto.status ?? defaultStatus,
+          billingType: passPlan.billingType,
+          durationValue: passPlan.durationValue,
+          durationUnit: passPlan.durationUnit,
+          totalVisits: passPlan.visitCount,
+          usedVisits: 0,
           freezeDaysLimit: dto.freezeDaysLimit ?? 0,
-          canRenew: dto.canRenew ?? true,
+          canRenew: dto.canRenew ?? !isVisitBased(passPlan.billingType),
           sortOrder: dto.sortOrder ?? 0,
         },
       });
@@ -675,6 +891,7 @@ export class MembershipsService {
         endsAt: true,
         freezeDaysLimit: true,
         freezeDaysUsed: true,
+        activatedAt: true,
       },
     });
 
@@ -730,8 +947,12 @@ export class MembershipsService {
       (data.startsAt as Date | undefined) ?? membership.startsAt;
     const nextEndsAt = (data.endsAt as Date | undefined) ?? membership.endsAt;
 
-    if (nextStartsAt >= nextEndsAt) {
+    if (nextStartsAt > nextEndsAt) {
       throw new BadRequestException('endsAt must be later than startsAt');
+    }
+
+    if (membership.activatedAt && (dto.startsAt || dto.endsAt)) {
+      data.activatedAt = nextStartsAt;
     }
 
     await this.prisma.userMembership.update({
@@ -821,8 +1042,33 @@ export class MembershipsService {
   private async syncMembershipState(membership: MembershipRecord) {
     const now = new Date();
     const activeFreeze = getActiveFreeze(membership);
+    const snapshot = resolveSnapshot(membership);
+    const usageMode = getUsageMode(snapshot.billingType);
 
-    if (membership.status === MembershipStatus.REFUNDED) {
+    if (
+      membership.status === MembershipStatus.REFUNDED ||
+      membership.status === MembershipStatus.PENDING_ACTIVATION
+    ) {
+      return membership;
+    }
+
+    if (
+      usageMode === 'VISIT' &&
+      snapshot.totalVisits !== null &&
+      membership.usedVisits >= snapshot.totalVisits &&
+      membership.status !== MembershipStatus.EXPIRED
+    ) {
+      await this.prisma.userMembership.update({
+        where: { id: membership.id },
+        data: {
+          status: MembershipStatus.EXPIRED,
+        },
+      });
+
+      return this.getMembershipById(membership.id);
+    }
+
+    if (usageMode === 'VISIT') {
       return membership;
     }
 
@@ -931,13 +1177,18 @@ export class MembershipsService {
   }
 
   private mapMembershipCard(membership: MembershipRecord) {
+    const snapshot = resolveSnapshot(membership);
+    const usageMode = getUsageMode(snapshot.billingType);
     const freezeDaysLeft = Math.max(
       0,
       membership.freezeDaysLimit - membership.freezeDaysUsed,
     );
-    const daysLeft = getDaysLeft(membership.endsAt);
+    const remainingVisits = getRemainingVisits(membership, snapshot);
     const renewalAvailable =
-      membership.canRenew && canRequestRenewalNow(membership);
+      usageMode === 'TERM' &&
+      membership.status !== MembershipStatus.PENDING_ACTIVATION &&
+      membership.canRenew &&
+      canRequestRenewalNow(membership);
     const status = getStatusMeta(membership.status, renewalAvailable);
 
     return {
@@ -945,14 +1196,34 @@ export class MembershipsService {
       title: membership.title,
       subtitle:
         membership.subtitle ??
-        formatMembershipPeriod(membership.startsAt, membership.endsAt),
+        formatMembershipSubtitle(membership, usageMode, snapshot),
       planOrigin: formatPlanOriginFromMembership(membership),
-      startsAt: membership.startsAt.toISOString(),
+      issuedAt: membership.issuedAt.toISOString(),
+      activatedAt: membership.activatedAt?.toISOString() ?? null,
+      startsAt:
+        usageMode === 'TERM' && membership.status !== MembershipStatus.PENDING_ACTIVATION
+          ? membership.startsAt.toISOString()
+          : null,
       status: membership.status,
+      activationStatus:
+        membership.status === MembershipStatus.PENDING_ACTIVATION
+          ? 'PENDING'
+          : 'ACTIVATED',
       statusLabel: status.label,
       statusTone: status.tone,
-      expiresAt: membership.endsAt.toISOString(),
-      daysLeft,
+      billingType: snapshot.billingType,
+      usageMode,
+      expiresAt:
+        usageMode === 'TERM' && membership.status !== MembershipStatus.PENDING_ACTIVATION
+          ? membership.endsAt.toISOString()
+          : null,
+      daysLeft:
+        usageMode === 'TERM' && membership.status !== MembershipStatus.PENDING_ACTIVATION
+          ? getDaysLeft(membership.endsAt)
+          : null,
+      totalVisits: snapshot.totalVisits,
+      usedVisits: membership.usedVisits,
+      remainingVisits,
       freezeDaysLeft,
       features: membership.passPlan.features.map((feature) => ({
         id: feature.id,
@@ -960,13 +1231,15 @@ export class MembershipsService {
         icon: feature.icon,
       })),
       canFreeze:
+        usageMode === 'TERM' &&
         membership.status === MembershipStatus.ACTIVE &&
         freezeDaysLeft > 0 &&
         !getActiveFreeze(membership),
       canUnfreeze:
+        usageMode === 'TERM' &&
         membership.status === MembershipStatus.FROZEN &&
         Boolean(getActiveFreeze(membership)),
-      canRenew: membership.canRenew,
+      canRenew: membership.canRenew && usageMode === 'TERM',
       canRequestRenewalNow: renewalAvailable,
       scheduleAvailable: false,
       hasQr:
@@ -977,18 +1250,37 @@ export class MembershipsService {
   }
 
   private mapHistoryItem(membership: MembershipRecord) {
+    const snapshot = resolveSnapshot(membership);
+    const usageMode = getUsageMode(snapshot.billingType);
     const status = getStatusMeta(membership.status, false);
 
     return {
       id: membership.id,
       title: membership.title,
-      subtitle: formatMembershipPeriod(membership.startsAt, membership.endsAt),
+      subtitle: formatMembershipSubtitle(membership, usageMode, snapshot),
       planOrigin: formatPlanOriginFromMembership(membership),
-      startsAt: membership.startsAt.toISOString(),
+      issuedAt: membership.issuedAt.toISOString(),
+      activatedAt: membership.activatedAt?.toISOString() ?? null,
+      startsAt:
+        usageMode === 'TERM' && membership.activatedAt
+          ? membership.startsAt.toISOString()
+          : null,
       status: membership.status,
+      activationStatus:
+        membership.status === MembershipStatus.PENDING_ACTIVATION
+          ? 'PENDING'
+          : 'ACTIVATED',
       statusLabel: status.label,
       statusTone: status.tone,
-      expiresAt: membership.endsAt.toISOString(),
+      billingType: snapshot.billingType,
+      usageMode,
+      expiresAt:
+        usageMode === 'TERM' && membership.activatedAt
+          ? membership.endsAt.toISOString()
+          : null,
+      totalVisits: snapshot.totalVisits,
+      usedVisits: membership.usedVisits,
+      remainingVisits: getRemainingVisits(membership, snapshot),
       hasQr:
         membership.status !== MembershipStatus.REFUNDED &&
         Boolean(membership.qrGeneratedAt),
@@ -1002,14 +1294,28 @@ export class MembershipsService {
   }
 
   private mapAdminMembership(membership: MembershipRecord) {
+    const snapshot = resolveSnapshot(membership);
+    const usageMode = getUsageMode(snapshot.billingType);
+
     return {
       id: membership.id,
       title: membership.title,
       subtitle: membership.subtitle,
       description: membership.description,
+      issuedAt: membership.issuedAt.toISOString(),
+      activatedAt: membership.activatedAt?.toISOString() ?? null,
       startsAt: membership.startsAt.toISOString(),
       endsAt: membership.endsAt.toISOString(),
       status: membership.status,
+      activationStatus:
+        membership.status === MembershipStatus.PENDING_ACTIVATION
+          ? 'PENDING'
+          : 'ACTIVATED',
+      billingType: snapshot.billingType,
+      usageMode,
+      totalVisits: snapshot.totalVisits,
+      usedVisits: membership.usedVisits,
+      remainingVisits: getRemainingVisits(membership, snapshot),
       freezeDaysLimit: membership.freezeDaysLimit,
       freezeDaysUsed: membership.freezeDaysUsed,
       canRenew: membership.canRenew,
@@ -1058,6 +1364,55 @@ export class MembershipsService {
   }
 }
 
+function resolveSnapshot(membership: SnapshotCarrier): MembershipSnapshot {
+  const billingType = membership.billingType ?? membership.passPlan?.billingType ?? null;
+  const durationValue =
+    membership.durationValue ?? membership.passPlan?.durationValue ?? null;
+  const durationUnit =
+    membership.durationUnit ?? membership.passPlan?.durationUnit ?? null;
+  const totalVisits = membership.totalVisits ?? membership.passPlan?.visitCount ?? null;
+
+  return {
+    billingType,
+    durationValue,
+    durationUnit,
+    totalVisits,
+  };
+}
+
+function isVisitBased(billingType: BillingType | null) {
+  return (
+    billingType === BillingType.SINGLE_VISIT ||
+    billingType === BillingType.VISIT_PACK
+  );
+}
+
+function getUsageMode(billingType: BillingType | null): UsageMode {
+  return isVisitBased(billingType) ? 'VISIT' : 'TERM';
+}
+
+function getRemainingVisits(
+  membership: Pick<MembershipRecord, 'usedVisits'>,
+  snapshot: MembershipSnapshot,
+) {
+  if (snapshot.totalVisits === null) {
+    return null;
+  }
+
+  return Math.max(0, snapshot.totalVisits - membership.usedVisits);
+}
+
+function isMembershipExhausted(
+  membership: Pick<MembershipRecord, 'billingType' | 'totalVisits' | 'usedVisits'>,
+) {
+  const snapshot = resolveSnapshot(membership);
+
+  return (
+    snapshot.totalVisits !== null &&
+    membership.usedVisits >= snapshot.totalVisits
+  );
+}
+
 function formatPlanOriginFromMembership(membership: MembershipRecord) {
   return formatPlanOriginParts(
     membership.passPlan.group.variant.category.title,
@@ -1077,16 +1432,46 @@ function formatPlanOriginParts(
 }
 
 function buildMembershipHistory(membership: MembershipRecord) {
-  const entries = [
+  const snapshot = resolveSnapshot(membership);
+  const usageMode = getUsageMode(snapshot.billingType);
+  const entries: Array<{
+    id: string;
+    label: string;
+    tone: 'default' | 'accent';
+  }> = [
     {
+      id: `issued-${membership.id}`,
+      label: `Выдан: ${formatDateTimeLabel(membership.issuedAt)}`,
+      tone: 'default' as const,
+    },
+  ];
+
+  if (membership.activatedAt) {
+    entries.push({
+      id: `activated-${membership.id}`,
+      label: `Активирован: ${formatDateTimeLabel(membership.activatedAt)}`,
+      tone: 'accent' as const,
+    });
+  }
+
+  if (usageMode === 'TERM' && membership.activatedAt) {
+    entries.push({
       id: `period-${membership.id}`,
       label: `Период действия: ${formatMembershipPeriod(
         membership.startsAt,
         membership.endsAt,
       )}`,
-      tone: 'default',
-    },
-  ];
+      tone: 'default' as const,
+    });
+  }
+
+  if (usageMode === 'VISIT' && snapshot.totalVisits !== null) {
+    entries.push({
+      id: `visits-${membership.id}`,
+      label: `Посещений использовано: ${membership.usedVisits} из ${snapshot.totalVisits}`,
+      tone: 'default' as const,
+    });
+  }
 
   for (const freeze of membership.freezes) {
     entries.push({
@@ -1100,46 +1485,147 @@ function buildMembershipHistory(membership: MembershipRecord) {
   return entries;
 }
 
+function formatMembershipSubtitle(
+  membership: MembershipRecord,
+  usageMode: UsageMode,
+  snapshot: MembershipSnapshot,
+) {
+  if (membership.status === MembershipStatus.PENDING_ACTIVATION) {
+    return 'Активируется при первом сканировании в клубе';
+  }
+
+  if (usageMode === 'VISIT' && snapshot.totalVisits !== null) {
+    return `Осталось посещений: ${Math.max(
+      0,
+      snapshot.totalVisits - membership.usedVisits,
+    )}`;
+  }
+
+  return formatMembershipPeriod(membership.startsAt, membership.endsAt);
+}
+
+function getMembershipStateLabel(membership: MembershipRecord) {
+  const snapshot = resolveSnapshot(membership);
+  const usageMode = getUsageMode(snapshot.billingType);
+
+  if (membership.status === MembershipStatus.PENDING_ACTIVATION) {
+    return 'Ожидает активации в клубе';
+  }
+
+  if (membership.status === MembershipStatus.FROZEN) {
+    return 'Заморожен';
+  }
+
+  if (membership.status === MembershipStatus.REFUNDED) {
+    return 'Возврат оформлен';
+  }
+
+  if (membership.status === MembershipStatus.EXPIRED && usageMode === 'VISIT') {
+    return 'Посещения закончились';
+  }
+
+  if (membership.status === MembershipStatus.EXPIRED) {
+    return 'Срок действия закончился';
+  }
+
+  if (usageMode === 'VISIT') {
+    const remainingVisits = getRemainingVisits(membership, snapshot);
+    return `Осталось посещений: ${remainingVisits ?? 0}`;
+  }
+
+  return `Действует до ${formatDate(membership.endsAt)}`;
+}
+
+function getMembershipStateLabelFromData(input: {
+  status: MembershipStatus;
+  billingType: BillingType | null;
+  totalVisits: number | null;
+  usedVisits: number;
+  endsAt: Date;
+}) {
+  if (input.status === MembershipStatus.PENDING_ACTIVATION) {
+    return 'Ожидает активации в клубе';
+  }
+
+  if (input.status === MembershipStatus.FROZEN) {
+    return 'Заморожен';
+  }
+
+  if (input.status === MembershipStatus.REFUNDED) {
+    return 'Возврат оформлен';
+  }
+
+  if (isVisitBased(input.billingType)) {
+    const remainingVisits =
+      input.totalVisits === null
+        ? null
+        : Math.max(0, input.totalVisits - input.usedVisits);
+
+    if (input.status === MembershipStatus.EXPIRED) {
+      return 'Посещения закончились';
+    }
+
+    return `Осталось посещений: ${remainingVisits ?? 0}`;
+  }
+
+  if (input.status === MembershipStatus.EXPIRED) {
+    return 'Срок действия закончился';
+  }
+
+  return `Действует до ${formatDate(input.endsAt)}`;
+}
+
 function getStatusMeta(status: MembershipStatus, canRequestRenewal: boolean) {
+  if (status === MembershipStatus.PENDING_ACTIVATION) {
+    return {
+      label: 'Ожидает активации',
+      tone: 'warning',
+    } as const;
+  }
+
   if (status === MembershipStatus.REFUNDED) {
     return {
       label: 'Возврат оформлен',
       tone: 'muted',
-    };
+    } as const;
   }
 
   if (status === MembershipStatus.FROZEN) {
     return {
       label: 'Заморожен',
       tone: 'muted',
-    };
+    } as const;
   }
 
   if (status === MembershipStatus.EXPIRED && canRequestRenewal) {
     return {
       label: 'Доступно продление',
       tone: 'warning',
-    };
+    } as const;
   }
 
   if (status === MembershipStatus.EXPIRED) {
     return {
-      label: 'Ваш абонемент закончился',
+      label: 'Абонемент завершён',
       tone: 'danger',
-    };
+    } as const;
   }
 
   return {
     label: 'Активен',
     tone: 'success',
-  };
+  } as const;
 }
 
 function isVisibleInActiveBlock(membership: MembershipRecord) {
+  const snapshot = resolveSnapshot(membership);
+
   return (
+    membership.status === MembershipStatus.PENDING_ACTIVATION ||
     membership.status === MembershipStatus.ACTIVE ||
     membership.status === MembershipStatus.FROZEN ||
-    (membership.status === MembershipStatus.EXPIRED &&
+    (getUsageMode(snapshot.billingType) === 'TERM' &&
+      membership.status === MembershipStatus.EXPIRED &&
       membership.canRenew &&
       canRequestRenewalNow(membership))
   );
@@ -1204,6 +1690,16 @@ function formatDate(date: Date) {
   }).format(date);
 }
 
+function formatDateTimeLabel(date: Date) {
+  return new Intl.DateTimeFormat('ru-RU', {
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date);
+}
+
 function parseDate(value: string, fieldName: string) {
   const parsed = new Date(value);
 
@@ -1214,24 +1710,20 @@ function parseDate(value: string, fieldName: string) {
   return parsed;
 }
 
-function calculateMembershipEndsAt(
+function calculateEndsAtForActivation(
   startsAt: Date,
-  passPlan: {
-    durationValue: number | null;
-    durationUnit: DurationUnit | null;
-    billingType: BillingType | null;
-  },
+  snapshot: MembershipSnapshot,
 ) {
-  if (passPlan.durationValue && passPlan.durationUnit) {
-    return addDuration(startsAt, passPlan.durationValue, passPlan.durationUnit);
+  if (snapshot.billingType === BillingType.SINGLE_VISIT) {
+    return startsAt;
   }
 
-  if (passPlan.billingType === BillingType.SINGLE_VISIT) {
-    return addDays(startsAt, 1);
+  if (snapshot.billingType === BillingType.VISIT_PACK) {
+    return startsAt;
   }
 
-  if (passPlan.billingType === BillingType.VISIT_PACK) {
-    return addMonths(startsAt, 1);
+  if (snapshot.durationValue && snapshot.durationUnit) {
+    return addDuration(startsAt, snapshot.durationValue, snapshot.durationUnit);
   }
 
   return addMonths(startsAt, 1);

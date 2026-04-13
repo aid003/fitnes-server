@@ -20,9 +20,14 @@ export type MembershipQrPayload = {
     title: string;
     subtitle: string | null;
     status: string;
-    startsAt: string;
-    endsAt: string;
+    issuedAt: string;
+    activatedAt: string | null;
+    startsAt: string | null;
+    endsAt: string | null;
     freezeDaysLimit: number;
+    billingType: string | null;
+    totalVisits: number | null;
+    usedVisits: number;
   };
   plan: {
     id: string;
@@ -35,6 +40,7 @@ export type MembershipQrPayload = {
     billingType: string | null;
     durationValue: number | null;
     durationUnit: string | null;
+    visitCount: number | null;
   };
   payment: {
     paymentId: string;
