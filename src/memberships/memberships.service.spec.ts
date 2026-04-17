@@ -129,6 +129,28 @@ describe('MembershipsService', () => {
     expect(result.completedMemberships[0]?.hasQr).toBe(false);
   });
 
+  it('keeps two active memberships with the same plan as separate cards', async () => {
+    prismaService.userMembership.findMany.mockResolvedValue([
+      membershipRecord,
+      {
+        ...membershipRecord,
+        id: 'membership-2',
+        issuedAt: new Date('2026-03-02T00:00:00.000Z'),
+        createdAt: new Date('2026-03-02T00:00:00.000Z'),
+        updatedAt: new Date('2026-03-02T00:00:00.000Z'),
+      },
+    ]);
+
+    const result = await membershipsService.getMyMemberships('user-1');
+
+    expect(result.activeMemberships).toHaveLength(2);
+    expect(result.activeMemberships.map((membership) => membership.id)).toEqual([
+      'membership-1',
+      'membership-2',
+    ]);
+    expect(result.activeMemberships[0]?.title).toBe(result.activeMemberships[1]?.title);
+  });
+
   it('rejects freeze when membership is already frozen', async () => {
     prismaService.userMembership.findFirst.mockResolvedValue({
       ...membershipRecord,
@@ -269,6 +291,48 @@ describe('MembershipsService', () => {
         }),
       }),
     );
+  });
+
+  it('allows admin to create another membership with the same user and plan', async () => {
+    prismaService.passPlan.findUnique.mockResolvedValue({
+      id: 'plan-1',
+      title: 'Безлимит',
+      subtitle: null,
+      description: null,
+      billingType: 'FIXED_TERM',
+      durationValue: 1,
+      durationUnit: 'MONTH',
+      visitCount: null,
+    });
+    prismaService.userMembership.findMany.mockResolvedValue([
+      membershipRecord,
+      {
+        ...membershipRecord,
+        id: 'membership-2',
+        issuedAt: new Date('2026-03-02T00:00:00.000Z'),
+        createdAt: new Date('2026-03-02T00:00:00.000Z'),
+        updatedAt: new Date('2026-03-02T00:00:00.000Z'),
+      },
+    ]);
+
+    await membershipsService.createMembership({
+      userId: 'user-1',
+      passPlanId: 'plan-1',
+      startsAt: '2026-03-02T00:00:00.000Z',
+      endsAt: '2026-04-02T00:00:00.000Z',
+      freezeDaysLimit: 30,
+    });
+
+    expect(prismaService.userMembership.create).toHaveBeenCalledTimes(1);
+    expect(prismaService.userMembership.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          userId: 'user-1',
+          passPlanId: 'plan-1',
+        }),
+      }),
+    );
+    expect(prismaService.userMembership.findMany).toHaveBeenCalled();
   });
 
   it('revokes refunded membership and clears QR snapshot', async () => {

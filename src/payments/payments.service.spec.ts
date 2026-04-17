@@ -225,6 +225,172 @@ describe('PaymentsService', () => {
     expect(membershipsService.issueMembershipFromPayment).toHaveBeenCalledTimes(1);
   });
 
+  it('issues separate memberships for two paid orders of the same plan', async () => {
+    prismaService.paymentOrder.findUnique
+      .mockResolvedValueOnce(
+        createPaymentRecord({
+          id: 'payment-1',
+          userId: 'user-1',
+          passPlanId: 'plan-1',
+          gatewayProvider: 'TBANK',
+          gatewayPaymentId: '700001',
+          status: PaymentOrderStatus.REDIRECT_READY,
+        }),
+      )
+      .mockResolvedValueOnce(
+        createPaymentRecord({
+          id: 'payment-2',
+          userId: 'user-1',
+          passPlanId: 'plan-1',
+          gatewayProvider: 'TBANK',
+          gatewayPaymentId: '700002',
+          status: PaymentOrderStatus.REDIRECT_READY,
+        }),
+      );
+    prismaService.paymentOrder.update
+      .mockResolvedValueOnce(
+        createPaymentRecord({
+          id: 'payment-1',
+          userId: 'user-1',
+          passPlanId: 'plan-1',
+          gatewayProvider: 'TBANK',
+          gatewayPaymentId: '700001',
+          status: PaymentOrderStatus.PAID,
+          gatewayStatus: 'CONFIRMED',
+          paidAt: new Date('2026-04-03T10:00:00.000Z'),
+        }),
+      )
+      .mockResolvedValueOnce(
+        createPaymentRecord({
+          id: 'payment-1',
+          userId: 'user-1',
+          passPlanId: 'plan-1',
+          gatewayProvider: 'TBANK',
+          gatewayPaymentId: '700001',
+          status: PaymentOrderStatus.PAID,
+          gatewayStatus: 'CONFIRMED',
+          paidAt: new Date('2026-04-03T10:00:00.000Z'),
+          membershipId: 'membership-1',
+          membershipIssuedAt: new Date('2026-04-03T10:00:01.000Z'),
+        }),
+      )
+      .mockResolvedValueOnce(
+        createPaymentRecord({
+          id: 'payment-2',
+          userId: 'user-1',
+          passPlanId: 'plan-1',
+          gatewayProvider: 'TBANK',
+          gatewayPaymentId: '700002',
+          status: PaymentOrderStatus.PAID,
+          gatewayStatus: 'CONFIRMED',
+          paidAt: new Date('2026-04-03T10:05:00.000Z'),
+        }),
+      )
+      .mockResolvedValueOnce(
+        createPaymentRecord({
+          id: 'payment-2',
+          userId: 'user-1',
+          passPlanId: 'plan-1',
+          gatewayProvider: 'TBANK',
+          gatewayPaymentId: '700002',
+          status: PaymentOrderStatus.PAID,
+          gatewayStatus: 'CONFIRMED',
+          paidAt: new Date('2026-04-03T10:05:00.000Z'),
+          membershipId: 'membership-2',
+          membershipIssuedAt: new Date('2026-04-03T10:05:01.000Z'),
+        }),
+      );
+    membershipsService.issueMembershipFromPayment
+      .mockResolvedValueOnce({ id: 'membership-1' })
+      .mockResolvedValueOnce({ id: 'membership-2' });
+    (global.fetch as jest.Mock)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          Success: true,
+          ErrorCode: '0',
+          Status: 'CONFIRMED',
+          PaymentId: '700001',
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          Success: true,
+          ErrorCode: '0',
+          Status: 'CONFIRMED',
+          PaymentId: '700002',
+        }),
+      });
+
+    const first = await paymentsService.confirmPayment('user-1', 'payment-1');
+    const second = await paymentsService.confirmPayment('user-1', 'payment-2');
+
+    expect(first.membershipId).toBe('membership-1');
+    expect(second.membershipId).toBe('membership-2');
+    expect(membershipsService.issueMembershipFromPayment).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        userId: 'user-1',
+        passPlanId: 'plan-1',
+      }),
+    );
+    expect(membershipsService.issueMembershipFromPayment).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        userId: 'user-1',
+        passPlanId: 'plan-1',
+      }),
+    );
+  });
+
+  it('does not issue membership again when the same payment already has a membership id', async () => {
+    prismaService.paymentOrder.findUnique.mockResolvedValue(
+      createPaymentRecord({
+        id: 'payment-1',
+        userId: 'user-1',
+        gatewayProvider: 'TBANK',
+        gatewayPaymentId: '700001',
+        status: PaymentOrderStatus.PAID,
+        gatewayStatus: 'CONFIRMED',
+        paidAt: new Date('2026-04-03T10:00:00.000Z'),
+        membershipId: 'membership-1',
+        membershipIssuedAt: null,
+      }),
+    );
+    prismaService.paymentOrder.update.mockResolvedValue(
+      createPaymentRecord({
+        id: 'payment-1',
+        userId: 'user-1',
+        gatewayProvider: 'TBANK',
+        gatewayPaymentId: '700001',
+        status: PaymentOrderStatus.PAID,
+        gatewayStatus: 'CONFIRMED',
+        paidAt: new Date('2026-04-03T10:00:00.000Z'),
+        membershipId: 'membership-1',
+        membershipIssuedAt: null,
+      }),
+    );
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        Success: true,
+        ErrorCode: '0',
+        Status: 'CONFIRMED',
+        PaymentId: '700001',
+      }),
+    });
+
+    const result = await paymentsService.confirmPayment('user-1', 'payment-1');
+
+    expect(result.membershipId).toBe('membership-1');
+    expect(membershipsService.issueMembershipFromPayment).not.toHaveBeenCalled();
+    expect(membershipsService.attachQrSnapshotFromPayment).toHaveBeenCalledWith(
+      'membership-1',
+      'payment-1',
+    );
+  });
+
   it('rejects webhook state changes when token is invalid', async () => {
     prismaService.paymentOrder.findFirst.mockResolvedValue(
       createPaymentRecord({

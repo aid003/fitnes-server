@@ -1960,7 +1960,14 @@ function resolvePaymentState(
 }
 
 function shouldIssueMembership(payment: PaymentRecord) {
-  return payment.status === PaymentOrderStatus.PAID && !payment.membershipIssuedAt;
+  // Multiple paid orders for the same user and plan must produce multiple
+  // memberships. The only duplicate we suppress is re-issuing for the same
+  // payment after confirm/webhook retries.
+  return (
+    payment.status === PaymentOrderStatus.PAID &&
+    !payment.membershipId &&
+    !payment.membershipIssuedAt
+  );
 }
 
 function canRefund(payment: PaymentRecord) {
