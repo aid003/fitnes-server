@@ -13,6 +13,11 @@ export class UpdateSelfDto {
   @MaxLength(100)
   name?: string;
 
+  @IsOptional()
+  @IsString()
+  @MaxLength(32)
+  phone?: string;
+
   @ValidateIf((object: UpdateSelfDto) => object.newPassword !== undefined)
   @IsString()
   @MinLength(8)

@@ -191,6 +191,7 @@ export class PaymentsService {
         id: true,
         email: true,
         name: true,
+        phone: true,
       },
     });
 
@@ -276,6 +277,7 @@ export class PaymentsService {
         planSubtitle: passPlan.subtitle,
         planDescription: passPlan.description,
         payerEmail: user.email,
+        payerPhone: user.phone,
         receiptPayload,
         fiscalPayload: receiptPayload,
       },
@@ -883,7 +885,7 @@ export class PaymentsService {
   }
 
   private buildReceiptPayload(input: {
-    user: { email: string; name?: string | null };
+    user: { email: string; name?: string | null; phone?: string | null };
     passPlan: {
       title: string;
       price: number;
@@ -897,6 +899,7 @@ export class PaymentsService {
 
     return {
       Email: receiptEmail,
+      Phone: input.user.phone || undefined,
       Taxation:
         this.configService.get<string>('TBANK_RECEIPT_TAXATION') ??
         this.configService.get<string>('TBANK_TAXATION') ??

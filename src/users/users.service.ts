@@ -15,6 +15,7 @@ const userPublicSelect = {
   id: true,
   email: true,
   name: true,
+  phone: true,
   role: true,
   isActive: true,
   createdAt: true,
@@ -50,6 +51,7 @@ export class UsersService {
         data: {
           name: input.name,
           email: input.email,
+          phone: null,
           passwordHash: input.passwordHash,
           role: input.role ?? UserRole.USER,
           isActive: input.isActive ?? true,
@@ -142,6 +144,8 @@ export class UsersService {
         where: { id: userId },
         data: {
           name: dto.name,
+          phone:
+            dto.phone === undefined ? undefined : normalizeUserPhone(dto.phone),
           passwordHash: dto.newPassword
             ? await this.passwordService.hash(dto.newPassword)
             : undefined,
@@ -208,4 +212,9 @@ export class UsersService {
       throw new NotFoundException('User not found');
     }
   }
+}
+
+function normalizeUserPhone(phone: string): string | null {
+  const normalized = phone.trim();
+  return normalized.length > 0 ? normalized : null;
 }

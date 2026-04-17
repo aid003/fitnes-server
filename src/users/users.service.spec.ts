@@ -68,6 +68,28 @@ describe('UsersService', () => {
     ).rejects.toBeInstanceOf(ForbiddenException);
   });
 
+  it('stores normalized phone on self update', async () => {
+    prismaService.user.findUnique.mockResolvedValue(createStoredUser());
+    prismaService.user.update.mockResolvedValue({
+      ...createStoredUser(),
+      phone: '+79991234567',
+    });
+
+    const result = await usersService.updateMe('user-1', {
+      phone: '  +79991234567  ',
+    });
+
+    expect(prismaService.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'user-1' },
+        data: expect.objectContaining({
+          phone: '+79991234567',
+        }),
+      }),
+    );
+    expect(result.phone).toBe('+79991234567');
+  });
+
   it('updates status for admin management', async () => {
     prismaService.user.findUnique.mockResolvedValue({
       id: 'user-2',
@@ -76,6 +98,7 @@ describe('UsersService', () => {
       id: 'user-2',
       email: 'admin-managed@example.com',
       name: 'Managed User',
+      phone: null,
       role: UserRole.COACH,
       isActive: false,
       createdAt: new Date(),
@@ -107,6 +130,7 @@ function createStoredUser() {
     id: 'user-1',
     email: 'test@example.com',
     name: 'Test User',
+    phone: null,
     passwordHash: 'stored-hash',
     role: UserRole.USER,
     isActive: true,

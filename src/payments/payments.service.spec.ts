@@ -97,6 +97,7 @@ describe('PaymentsService', () => {
       id: 'user-1',
       email: 'user@example.com',
       name: 'User',
+      phone: '+79991234567',
     });
     prismaService.passPlan.findFirst.mockResolvedValue({
       id: 'plan-1',
@@ -163,6 +164,7 @@ describe('PaymentsService', () => {
     expect(payload.PayType).toBe('O');
     expect(payload.Language).toBe('ru');
     expect(payload.Receipt.Taxation).toBe('osn');
+    expect(payload.Receipt.Phone).toBe('+79991234567');
     expect(payload.Receipt.Items[0].Tax).toBe('none');
     expect(payload.Receipt.Items[0].PaymentMethod).toBe('advance');
     expect(payload.Receipt.Items[0].PaymentObject).toBe('payment');
@@ -553,10 +555,11 @@ function createPaymentRecord(overrides: Record<string, any> = {}) {
     planSubtitle: 'Безлимит',
     planDescription: null,
     payerEmail: 'user@example.com',
-    payerPhone: null,
+    payerPhone: '+79991234567',
     fiscalPayload: null,
     receiptPayload: {
       Email: 'user@example.com',
+      Phone: '+79991234567',
       Taxation: 'osn',
       Items: [],
     },
@@ -574,6 +577,7 @@ function createPaymentRecord(overrides: Record<string, any> = {}) {
       id: 'user-1',
       name: 'User',
       email: 'user@example.com',
+      phone: '+79991234567',
     },
     passPlan: {
       id: 'plan-1',
