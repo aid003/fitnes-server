@@ -501,6 +501,59 @@ describe('PaymentsService', () => {
     );
   });
 
+  it('maps admin ledger diagnostics for unfinished orders', async () => {
+    prismaService.paymentOrder.findMany.mockResolvedValue([
+      createPaymentRecord({
+        id: 'payment-redirect',
+        status: PaymentOrderStatus.REDIRECT_READY,
+        gatewayStatus: 'NEW',
+        membershipId: null,
+        membershipIssuedAt: null,
+      }),
+    ]);
+
+    const result = await paymentsService.getAdminPaymentsLedger({
+      range: '30d',
+      limit: 20,
+    });
+
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]).toEqual(
+      expect.objectContaining({
+        adminDiagnosis: 'Оплата не завершена',
+        adminReason: 'Пользователь перешёл к оплате, но платёж не завершён.',
+        isCompletedPayment: false,
+        isIssueActionRequired: false,
+      }),
+    );
+  });
+
+  it('marks paid order without issuance as admin action required', async () => {
+    prismaService.paymentOrder.findUnique.mockResolvedValue({
+      ...createPaymentRecord({
+        id: 'payment-1',
+        status: PaymentOrderStatus.PAID,
+        gatewayStatus: 'CONFIRMED',
+        membershipId: null,
+        membershipIssuedAt: null,
+        paidAt: new Date('2026-04-03T10:00:00.000Z'),
+      }),
+      events: [],
+    });
+
+    const result = await paymentsService.getAdminPaymentDetails('payment-1');
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        adminDiagnosis: 'Оплата подтверждена, абонемент не выдан',
+        adminReason:
+          'Банк подтвердил оплату, но запись о выдаче абонемента отсутствует.',
+        isCompletedPayment: true,
+        isIssueActionRequired: true,
+      }),
+    );
+  });
+
   it('revokes membership when webhook reports refunded payment', async () => {
     const notification = {
       PaymentId: '700001',

@@ -130,6 +130,16 @@ type AdminLedgerCursor = {
   id: string;
 };
 
+type AdminDiagnosisTone = 'success' | 'warning' | 'danger' | 'muted';
+
+type AdminPaymentDiagnosis = {
+  adminDiagnosis: string;
+  adminDiagnosisTone: AdminDiagnosisTone;
+  adminReason: string;
+  isCompletedPayment: boolean;
+  isIssueActionRequired: boolean;
+};
+
 type TBankInitResponse = {
   Success?: boolean;
   ErrorCode?: string;
@@ -606,28 +616,8 @@ export class PaymentsService {
     });
 
     const items = records.slice(0, limit).map((payment) => ({
-      paymentId: payment.id,
-      merchantOrderNumber: payment.merchantOrderNumber,
+      ...this.mapAdminPaymentSummary(payment),
       paidAt: resolveLedgerTimestamp(payment),
-      amount: kopecksToRubles(payment.amount),
-      currency: payment.currency,
-      status: payment.status,
-      gatewayProvider: payment.gatewayProvider,
-      gatewayPaymentId: payment.gatewayPaymentId,
-      gatewayStatus: payment.gatewayStatus,
-      refundedAmount: kopecksToRubles(payment.refundedAmount),
-      canRefund: canRefund(payment),
-      user: payment.user,
-      plan: {
-        id: payment.passPlan?.id ?? payment.passPlanId,
-        title: payment.planTitle,
-        subtitle: payment.planSubtitle,
-        categoryTitle: payment.passPlan?.group.variant.category.title ?? null,
-        variantTitle: payment.passPlan?.group.variant.title ?? null,
-        groupTitle: payment.passPlan?.group.title ?? null,
-      },
-      membershipId: payment.membershipId,
-      membershipIssuedAt: payment.membershipIssuedAt?.toISOString() ?? null,
     }));
 
     const lastItem = items.at(-1);
@@ -657,6 +647,7 @@ export class PaymentsService {
 
     return {
       ...this.mapPaymentStatus(payment),
+      ...buildAdminPaymentDiagnosis(payment),
       gatewayProvider: payment.gatewayProvider,
       gatewayPaymentId: payment.gatewayPaymentId,
       gatewayOrderId: payment.gatewayOrderId,
@@ -1434,6 +1425,7 @@ export class PaymentsService {
 
     return {
       paymentId: payment.id,
+      merchantOrderNumber: payment.merchantOrderNumber,
       status: payment.status,
       statusLabel: statusMeta.label,
       statusTone: statusMeta.tone,
@@ -1471,6 +1463,33 @@ export class PaymentsService {
         payment.status === PaymentOrderStatus.EXPIRED ||
         payment.status === PaymentOrderStatus.CANCELLED ||
         payment.status === PaymentOrderStatus.REFUNDED,
+    };
+  }
+
+  private mapAdminPaymentSummary(payment: PaymentRecord) {
+    return {
+      paymentId: payment.id,
+      merchantOrderNumber: payment.merchantOrderNumber,
+      amount: kopecksToRubles(payment.amount),
+      currency: payment.currency,
+      status: payment.status,
+      gatewayProvider: payment.gatewayProvider,
+      gatewayPaymentId: payment.gatewayPaymentId,
+      gatewayStatus: payment.gatewayStatus,
+      refundedAmount: kopecksToRubles(payment.refundedAmount),
+      canRefund: canRefund(payment),
+      user: payment.user,
+      plan: {
+        id: payment.passPlan?.id ?? payment.passPlanId,
+        title: payment.planTitle,
+        subtitle: payment.planSubtitle,
+        categoryTitle: payment.passPlan?.group.variant.category.title ?? null,
+        variantTitle: payment.passPlan?.group.variant.title ?? null,
+        groupTitle: payment.passPlan?.group.title ?? null,
+      },
+      membershipId: payment.membershipId,
+      membershipIssuedAt: payment.membershipIssuedAt?.toISOString() ?? null,
+      ...buildAdminPaymentDiagnosis(payment),
     };
   }
 }
@@ -2036,6 +2055,89 @@ function getPaymentStatusMeta(status: PaymentOrderStatus) {
         label: 'Платёж создан',
         tone: 'warning',
         message: 'Переходим к оплате через банковскую страницу.',
+      };
+  }
+}
+
+function buildAdminPaymentDiagnosis(payment: PaymentRecord): AdminPaymentDiagnosis {
+  const isIssued = Boolean(payment.membershipIssuedAt);
+  const isCompletedPayment =
+    payment.status === PaymentOrderStatus.PAID ||
+    payment.status === PaymentOrderStatus.REFUNDED;
+  const isIssueActionRequired =
+    payment.status === PaymentOrderStatus.PAID && !isIssued;
+
+  switch (payment.status) {
+    case PaymentOrderStatus.PAID:
+      if (isIssued) {
+        return {
+          adminDiagnosis: 'Оплата подтверждена, абонемент выдан',
+          adminDiagnosisTone: 'success',
+          adminReason: 'Банк подтвердил оплату, абонемент выдан.',
+          isCompletedPayment,
+          isIssueActionRequired,
+        };
+      }
+
+      return {
+        adminDiagnosis: 'Оплата подтверждена, абонемент не выдан',
+        adminDiagnosisTone: 'danger',
+        adminReason:
+          'Банк подтвердил оплату, но запись о выдаче абонемента отсутствует.',
+        isCompletedPayment,
+        isIssueActionRequired,
+      };
+    case PaymentOrderStatus.REFUNDED:
+      return {
+        adminDiagnosis: 'Оплата возвращена',
+        adminDiagnosisTone: 'muted',
+        adminReason: 'Платёж возвращён.',
+        isCompletedPayment,
+        isIssueActionRequired,
+      };
+    case PaymentOrderStatus.PROCESSING:
+      return {
+        adminDiagnosis: 'Оплата в обработке',
+        adminDiagnosisTone: 'warning',
+        adminReason: 'Платёж ещё обрабатывается банком.',
+        isCompletedPayment,
+        isIssueActionRequired,
+      };
+    case PaymentOrderStatus.CREATED:
+    case PaymentOrderStatus.FORM_REGISTERED:
+      return {
+        adminDiagnosis: 'Оплата не завершена',
+        adminDiagnosisTone: 'warning',
+        adminReason: 'Счёт создан, подтверждения оплаты от банка нет.',
+        isCompletedPayment,
+        isIssueActionRequired,
+      };
+    case PaymentOrderStatus.REDIRECT_READY:
+    case PaymentOrderStatus.REDIRECTED:
+      return {
+        adminDiagnosis: 'Оплата не завершена',
+        adminDiagnosisTone: 'warning',
+        adminReason: 'Пользователь перешёл к оплате, но платёж не завершён.',
+        isCompletedPayment,
+        isIssueActionRequired,
+      };
+    case PaymentOrderStatus.FAILED:
+    case PaymentOrderStatus.EXPIRED:
+    case PaymentOrderStatus.CANCELLED:
+      return {
+        adminDiagnosis: 'Оплата не прошла',
+        adminDiagnosisTone: 'danger',
+        adminReason: 'Банк отклонил или отменил платёж.',
+        isCompletedPayment,
+        isIssueActionRequired,
+      };
+    default:
+      return {
+        adminDiagnosis: 'Оплата не завершена',
+        adminDiagnosisTone: 'warning',
+        adminReason: 'Состояние оплаты требует дополнительной проверки.',
+        isCompletedPayment,
+        isIssueActionRequired,
       };
   }
 }
