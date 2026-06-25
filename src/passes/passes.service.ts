@@ -180,7 +180,29 @@ export class PassesService implements OnModuleInit {
 
   async listAdminCategories(): Promise<PassCategoryDetails[]> {
     const categories = await this.prisma.passCategory.findMany({
-      select: passCategorySelect,
+      where: { isActive: true },
+      select: {
+        ...passCategorySelect,
+        variants: {
+          ...passCategorySelect.variants,
+          where: { isActive: true },
+          select: {
+            ...passVariantSelect,
+            groups: {
+              ...passVariantSelect.groups,
+              where: { isActive: true },
+              select: {
+                ...passPlanGroupSelect,
+                plans: {
+                  ...passPlanGroupSelect.plans,
+                  where: { isActive: true },
+                  select: passPlanSelect,
+                },
+              },
+            },
+          },
+        },
+      },
       orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
     });
 
@@ -227,15 +249,43 @@ export class PassesService implements OnModuleInit {
   async deleteCategory(categoryId: string): Promise<{ success: true }> {
     const category = await this.prisma.passCategory.findUnique({
       where: { id: categoryId },
-      select: { id: true, coverImageUrl: true },
+      select: { id: true },
     });
 
     if (!category) {
       throw new NotFoundException('Pass category not found');
     }
 
-    await this.prisma.passCategory.delete({ where: { id: categoryId } });
-    await deleteUploadedFile(category.coverImageUrl);
+    await this.prisma.$transaction(async (tx) => {
+      await tx.passPlan.updateMany({
+        where: {
+          group: {
+            variant: {
+              categoryId,
+            },
+          },
+        },
+        data: { isActive: false },
+      });
+      await tx.passPlanGroup.updateMany({
+        where: {
+          variant: {
+            categoryId,
+          },
+        },
+        data: { isActive: false },
+      });
+      await tx.passVariant.updateMany({
+        where: {
+          categoryId,
+        },
+        data: { isActive: false },
+      });
+      await tx.passCategory.update({
+        where: { id: categoryId },
+        data: { isActive: false },
+      });
+    });
 
     return { success: true };
   }
@@ -533,9 +583,30 @@ export class PassesService implements OnModuleInit {
   private async getAdminCategoryById(
     categoryId: string,
   ): Promise<PassCategoryDetails> {
-    const category = await this.prisma.passCategory.findUnique({
-      where: { id: categoryId },
-      select: passCategorySelect,
+    const category = await this.prisma.passCategory.findFirst({
+      where: { id: categoryId, isActive: true },
+      select: {
+        ...passCategorySelect,
+        variants: {
+          ...passCategorySelect.variants,
+          where: { isActive: true },
+          select: {
+            ...passVariantSelect,
+            groups: {
+              ...passVariantSelect.groups,
+              where: { isActive: true },
+              select: {
+                ...passPlanGroupSelect,
+                plans: {
+                  ...passPlanGroupSelect.plans,
+                  where: { isActive: true },
+                  select: passPlanSelect,
+                },
+              },
+            },
+          },
+        },
+      },
     });
 
     if (!category) {
@@ -2098,3 +2169,4 @@ function mapCategoryPricesToRubles(category: PassCategoryDetails): PassCategoryD
     })),
   };
 }
+

@@ -23,18 +23,21 @@ describe('PassesService', () => {
         create: jest.fn(),
         update: jest.fn(),
         delete: jest.fn(),
+        updateMany: jest.fn(),
       },
       passPlanGroup: {
         findUnique: jest.fn(),
         create: jest.fn(),
         update: jest.fn(),
         delete: jest.fn(),
+        updateMany: jest.fn(),
       },
       passPlan: {
         findUnique: jest.fn(),
         create: jest.fn(),
         update: jest.fn(),
         delete: jest.fn(),
+        updateMany: jest.fn(),
       },
       passBadge: {
         findUnique: jest.fn(),
@@ -49,6 +52,12 @@ describe('PassesService', () => {
         delete: jest.fn(),
       },
     };
+
+    prismaService.$transaction = jest
+      .fn()
+      .mockImplementation(async (callback: (tx: Record<string, any>) => unknown) =>
+        callback(prismaService),
+      );
 
     passesService = new PassesService(prismaService as PrismaService);
   });
@@ -110,6 +119,18 @@ describe('PassesService', () => {
       }),
     );
     expect(result).toHaveLength(1);
+  });
+
+  it('lists only active categories in admin catalog', async () => {
+    prismaService.passCategory.findMany.mockResolvedValue([]);
+
+    await passesService.listAdminCategories();
+
+    expect(prismaService.passCategory.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { isActive: true },
+      }),
+    );
   });
 
   it('returns full category details for public page', async () => {
@@ -186,7 +207,7 @@ describe('PassesService', () => {
       },
     });
     prismaService.passPlan.create.mockResolvedValue({});
-    prismaService.passCategory.findUnique.mockResolvedValue({
+    prismaService.passCategory.findFirst.mockResolvedValue({
       id: 'category-1',
       title: 'Unlimited',
       slug: 'unlimited',
@@ -223,25 +244,63 @@ describe('PassesService', () => {
     ).rejects.toBeInstanceOf(NotFoundException);
   });
 
+  it('archives category tree on deletion instead of hard delete', async () => {
+    prismaService.passCategory.findUnique.mockResolvedValue({
+      id: 'category-1',
+    });
+    await expect(passesService.deleteCategory('category-1')).resolves.toEqual({
+      success: true,
+    });
+    expect(prismaService.$transaction).toHaveBeenCalledTimes(1);
+    expect(prismaService.passPlan.updateMany).toHaveBeenCalledWith({
+      where: {
+        group: {
+          variant: {
+            categoryId: 'category-1',
+          },
+        },
+      },
+      data: { isActive: false },
+    });
+    expect(prismaService.passPlanGroup.updateMany).toHaveBeenCalledWith({
+      where: {
+        variant: {
+          categoryId: 'category-1',
+        },
+      },
+      data: { isActive: false },
+    });
+    expect(prismaService.passVariant.updateMany).toHaveBeenCalledWith({
+      where: {
+        categoryId: 'category-1',
+      },
+      data: { isActive: false },
+    });
+    expect(prismaService.passCategory.update).toHaveBeenCalledWith({
+      where: { id: 'category-1' },
+      data: { isActive: false },
+    });
+    expect(prismaService.passCategory.delete).not.toHaveBeenCalled();
+  });
+
   it('replaces category cover and removes previous uploaded file', async () => {
     const deleteUploadedFileSpy = jest
       .spyOn(uploadUtils, 'deleteUploadedFile')
       .mockResolvedValue(undefined);
 
-    prismaService.passCategory.findUnique
-      .mockResolvedValueOnce({
-        coverImageUrl: '/uploads/passes/old-cover.jpg',
-      })
-      .mockResolvedValueOnce({
-        id: 'category-1',
-        title: 'Unlimited',
-        slug: 'unlimited',
-        description: null,
-        coverImageUrl: '/uploads/passes/new-cover.jpg',
-        sortOrder: 0,
-        isActive: true,
-        variants: [],
-      });
+    prismaService.passCategory.findUnique.mockResolvedValueOnce({
+      coverImageUrl: '/uploads/passes/old-cover.jpg',
+    });
+    prismaService.passCategory.findFirst.mockResolvedValueOnce({
+      id: 'category-1',
+      title: 'Unlimited',
+      slug: 'unlimited',
+      description: null,
+      coverImageUrl: '/uploads/passes/new-cover.jpg',
+      sortOrder: 0,
+      isActive: true,
+      variants: [],
+    });
     prismaService.passCategory.update.mockResolvedValue({});
 
     const result = await passesService.updateCategoryCover(
@@ -264,20 +323,19 @@ describe('PassesService', () => {
       .spyOn(uploadUtils, 'deleteUploadedFile')
       .mockResolvedValue(undefined);
 
-    prismaService.passCategory.findUnique
-      .mockResolvedValueOnce({
-        coverImageUrl: '/uploads/passes/cover.jpg',
-      })
-      .mockResolvedValueOnce({
-        id: 'category-1',
-        title: 'Unlimited',
-        slug: 'unlimited',
-        description: null,
-        coverImageUrl: null,
-        sortOrder: 0,
-        isActive: true,
-        variants: [],
-      });
+    prismaService.passCategory.findUnique.mockResolvedValueOnce({
+      coverImageUrl: '/uploads/passes/cover.jpg',
+    });
+    prismaService.passCategory.findFirst.mockResolvedValueOnce({
+      id: 'category-1',
+      title: 'Unlimited',
+      slug: 'unlimited',
+      description: null,
+      coverImageUrl: null,
+      sortOrder: 0,
+      isActive: true,
+      variants: [],
+    });
     prismaService.passCategory.update.mockResolvedValue({});
 
     const result = await passesService.removeCategoryCover('category-1');
